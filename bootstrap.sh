@@ -1,14 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# bootstrap.sh — Ubuntu 24.04, старт: root по SSH
-# Авто: user+sudo, SSH hardening, (опц.) UFW, (опц.) fail2ban, (опц.) Docker, (опц.) MTProto, (опц.) aliases
-#
-# ВАЖНО:
-# - Скрипт меняет SSH (порт, root-login off, password auth off). Неверный ключ/порт = риск потери SSH-доступа.
-# - Делается бэкап /etc/ssh/sshd_config и проверка sshd -t перед рестартом.
-# - Алиасы добавляются ОПЦИОНАЛЬНО и пишутся в ~/.bash_aliases (стандартный путь).
-
 LOG_FILE="/var/log/bootstrap_start2.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
@@ -19,15 +11,25 @@ warn(){ echo "WARN: $*"; }
 [[ "$(id -u)" -eq 0 ]] || die "Запустите скрипт от root."
 
 # ---------------- helpers ----------------
+trim() {
+  # удаляет ведущие/концевые пробелы
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  echo "$s"
+}
+
 ask_default() {
   local p="$1" d="$2" v
   read -r -p "$p [$d]: " v || true
+  v="$(trim "$v")"
   echo "${v:-$d}"
 }
 
 ask_optional() {
   local p="$1" v
   read -r -p "$p (Enter — пропустить): " v || true
+  v="$(trim "$v")"
   echo "$v"
 }
 
@@ -35,7 +37,7 @@ ask_yesno() {
   local p="$1" d="$2" a
   while true; do
     read -r -p "$p (y/n) [$d]: " a || true
-    a="${a:-$d}"
+    a="$(trim "${a:-$d}")"
     case "$a" in
       y|Y) echo y; return 0 ;;
       n|N) echo n; return 0 ;;
@@ -46,13 +48,9 @@ ask_yesno() {
 
 is_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( 1 <= $1 && $1 <= 65535 )); }
 
-valid_user() {
-  [[ "$1" =~ ^[a-z_][a-z0-9_-]*$ ]] && [[ "$1" != "root" ]]
-}
+valid_user() { [[ "$1" =~ ^[a-z_][a-z0-9_-]*$ ]] && [[ "$1" != "root" ]]; }
 
-valid_key() {
-  [[ "$1" =~ ^ssh-(ed25519|rsa)[[:space:]][A-Za-z0-9+/=]+([[:space:]].*)?$ ]]
-}
+valid_key() { [[ "$1" =~ ^ssh-(ed25519|rsa)[[:space:]][A-Za-z0-9+/=]+([[:space:]].*)?$ ]]; }
 
 backup_file_if_exists() {
   local f="$1"
@@ -66,7 +64,9 @@ backup_file_if_exists() {
 backup_file_must() {
   local f="$1"
   [[ -f "$f" ]] || die "Файл не найден: $f"
-  cp -a "$f" "${f}.bak.$(date +%F_%H%M%S)"
+  local b="${f}.bak.$(date +%F_%H%M%S)"
+  cp -a "$f" "$b"
+  echo "$b"
 }
 
 ensure_kv() {
@@ -98,8 +98,8 @@ create_user() {
 }
 
 setup_keys() {
-  [[ -n "$PUBLIC_KEY" ]] || die "Публичный ключ пустой. Нельзя продолжать (иначе потеряете доступ после отключения пароля)."
-  valid_key "$PUBLIC_KEY" || die "Некорректный SSH-ключ (ожидается ssh-ed25519/ssh-rsa одной строкой)."
+  [[ -n "$PUBLIC_KEY" ]] || die "SSH-ключ обязателен. Нельзя продолжать."
+  valid_key "$PUBLIC_KEY" || die "Некорректный SSH-ключ (ssh-ed25519/ssh-rsa одной строкой)."
 
   local home
   home="$(getent passwd "$NEW_USER" | cut -d: -f6)"
@@ -117,7 +117,9 @@ setup_keys() {
 
 configure_ssh() {
   local f="/etc/ssh/sshd_config"
-  backup_file_must "$f"
+  local backup
+  backup="$(backup_file_must "$f")"
+  ok "Бэкап sshd_config: $backup"
 
   ensure_kv "$f" PermitRootLogin no
   ensure_kv "$f" PasswordAuthentication no
@@ -125,16 +127,22 @@ configure_ssh() {
   ensure_kv "$f" AuthorizedKeysFile ".ssh/authorized_keys"
   ensure_kv "$f" Port "$NEW_SSH_PORT"
 
-  sshd -t || die "Ошибка проверки sshd_config (sshd -t). Проверь /etc/ssh/sshd_config"
-  systemctl restart ssh || die "Не удалось перезапустить ssh"
+  if ! sshd -t; then
+    cp -a "$backup" "$f"
+    die "sshd -t не прошёл. Откат на бэкап выполнен."
+  fi
+
+  if ! systemctl restart ssh; then
+    cp -a "$backup" "$f"
+    systemctl restart ssh || true
+    die "Не удалось перезапустить SSH. Откат на бэкап выполнен."
+  fi
 
   if ss -lntp | grep -qE ":$NEW_SSH_PORT\b"; then
     ok "sshd слушает порт $NEW_SSH_PORT"
   else
-    warn "Порт $NEW_SSH_PORT не виден в ss -lntp. Проверь вручную."
+    warn "Не вижу прослушивание порта $NEW_SSH_PORT (ss -lntp)."
   fi
-
-  ok "SSH настроен"
 }
 
 setup_ufw() {
@@ -142,9 +150,7 @@ setup_ufw() {
   ufw default deny incoming
   ufw default allow outgoing
 
-  # Важно: открыть новый SSH порт ДО enable
   ufw allow "$NEW_SSH_PORT/tcp"
-
   [[ "$OPEN_443" == y ]] && ufw allow 443/tcp
   [[ "$OPEN_22"  == y ]] && ufw allow 22/tcp
 
@@ -174,7 +180,6 @@ port = ssh
 EOF
 
   [[ -n "$ALLOW_IP" ]] && echo "ignoreip = $ALLOW_IP" >> "$f"
-
   systemctl restart fail2ban
   fail2ban-client ping >/dev/null 2>&1 && ok "Fail2ban активен" || warn "Fail2ban установлен, но ping не прошёл"
 }
@@ -188,21 +193,19 @@ install_docker() {
 
   if [[ "$ADD_DOCKER_GROUP" == y ]]; then
     usermod -aG docker "$NEW_USER" || warn "Не удалось добавить $NEW_USER в группу docker"
-    ok "Пользователь добавлен в группу docker (нужен новый вход в сессию)"
+    ok "Пользователь добавлен в группу docker (нужен новый вход)"
   fi
 }
 
 install_mtproto() {
-  [[ "$INSTALL_DOCKER" == y ]] || die "MTProto требует Docker (выберите установку Docker = y)."
+  command -v docker >/dev/null 2>&1 || die "MTProto требует Docker (docker не найден)."
 
-  ss -lnt | awk '{print $4}' | grep -qE ":${MTPROTO_PORT}\$" && die "Порт $MTPROTO_PORT занят. Выберите другой."
+  ss -lnt | awk '{print $4}' | grep -qE ":${MTPROTO_PORT}\$" && die "Порт $MTPROTO_PORT занят."
 
   docker pull telegrammessenger/proxy
   docker run -d -p "${MTPROTO_PORT}:443" --name mtproto-proxy --restart=always -v proxy-config:/data telegrammessenger/proxy:latest
-
-  docker ps | grep -q mtproto-proxy && ok "MTProto контейнер запущен" || warn "Контейнер mtproto-proxy не виден в docker ps"
-  echo
-  echo "Логи MTProto (ищите secret/link):"
+  docker ps | grep -q mtproto-proxy && ok "MTProto контейнер запущен" || warn "mtproto-proxy не виден в docker ps"
+  echo "Логи MTProto (secret/link):"
   docker logs mtproto-proxy || true
 }
 
@@ -212,8 +215,6 @@ add_aliases() {
   [[ -n "$home" && -d "$home" ]] || die "Не найден home для пользователя $NEW_USER"
 
   aliases_file="$home/.bash_aliases"
-
-  # Бэкап если был
   backup_file_if_exists "$aliases_file" && ok "Сделан бэкап $aliases_file" || true
 
   touch "$aliases_file"
@@ -231,7 +232,7 @@ add_aliases() {
   add_alias_line ctop       "sudo docker run --rm -ti -v /var/run/docker.sock:/var/run/docker.sock:ro quay.io/vektorlab/ctop:latest"
   add_alias_line watchtower "sudo docker run --rm -v /var/run/docker.sock:/var/run/docker.sock nickfedor/watchtower --run-once --cleanup"
 
-  ok "Алиасы добавлены в $aliases_file (будут активны после нового входа или: source ~/.bashrc)"
+  ok "Алиасы добавлены в $aliases_file"
 }
 
 # ---------------- input ----------------
@@ -242,7 +243,7 @@ echo
 while true; do
   NEW_USER="$(ask_default "Имя нового пользователя" "user")"
   valid_user "$NEW_USER" && break
-  echo "Некорректное имя. Допустимо: user, admin, vpsuser (не root)."
+  echo "Некорректное имя (не root, латиница/цифры/_/-)."
 done
 
 while true; do
@@ -251,10 +252,9 @@ while true; do
   echo "Некорректный порт."
 done
 
-# Ключ НЕ допускаем пустым (иначе отключение пароля = потеря доступа)
 PUBLIC_KEY="$(ask_optional "Вставьте публичный SSH-ключ одной строкой")"
-[[ -n "$PUBLIC_KEY" ]] || die "SSH-ключ обязателен. Перезапустите скрипт и вставьте публичный ключ."
-valid_key "$PUBLIC_KEY" || die "Некорректный SSH-ключ (ожидается ssh-ed25519/ssh-rsa одной строкой)."
+[[ -n "$PUBLIC_KEY" ]] || die "SSH-ключ обязателен."
+valid_key "$PUBLIC_KEY" || die "Некорректный SSH-ключ."
 
 ALLOW_IP="$(ask_optional "IP для ignoreip в fail2ban")"
 
@@ -273,7 +273,7 @@ if [[ "$INSTALL_DOCKER" == y ]]; then
   ADD_DOCKER_GROUP="$(ask_yesno "Добавить пользователя в группу docker" y)"
 fi
 
-# --- Исправленный блок MTProto (строгое условие, как вы просили) ---
+# --- MTProto: строгое условие (как требовалось) ---
 INSTALL_MTPROTO="$(ask_yesno "Установить MTProto proxy" n)"
 MTPROTO_PORT="1243"
 if [[ "$INSTALL_MTPROTO" == y ]]; then
@@ -283,7 +283,7 @@ if [[ "$INSTALL_MTPROTO" == y ]]; then
     echo "Некорректный порт."
   done
 fi
-# ---------------------------------------------------------------
+# -------------------------------------------------
 
 ADD_ALIASES="$(ask_yesno "Добавить полезные алиасы новому пользователю" y)"
 
@@ -309,5 +309,4 @@ echo
 echo "=== Готово ==="
 echo "Вход: ssh -p $NEW_SSH_PORT $NEW_USER@<IP_СЕРВЕРА>"
 echo "Лог: $LOG_FILE"
-echo "Алиасы (если включали) активируются после нового входа или: source ~/.bashrc"
-echo "Рекомендуется проверить вход новым пользователем в новом окне терминала."
+echo "Алиасы (если включали): source ~/.bash_aliases (или новый вход)"
