@@ -4,13 +4,12 @@ set -Eeuo pipefail
 # bootstrap.sh — Ubuntu 24.04, старт: root по SSH
 # Авто: user+sudo, SSH hardening, (опц.) UFW, (опц.) fail2ban, (опц.) Docker, (опц.) MTProto, (опц.) aliases
 #
-# ИСПРАВЛЕНИЯ:
-# - Пользователь создаётся с паролем (НЕ disabled-password): пароль задаётся через диалог adduser
-# - /run/sshd создаётся перед sshd -t (фикс "Missing privilege separation directory")
-# - sshd_config: бэкап + откат при ошибке проверки/рестарта
-# - MTProto: default = y, порт спрашивается только если MTProto = y
-# - Алиасы: пишутся в ~/.bash_aliases (правильный файл); гарантируется подключение из ~/.bashrc
-# - После добавления алиасов — принудительная проверка наличия строк
+# КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ (по вашим логам):
+# 1) Docker: убран конфликт пакетов (НЕ ставим docker.io/containerd из Ubuntu после get.docker.com).
+#    Ставим Docker через get.docker.com + docker-compose-plugin из Docker repo.
+# 2) MTProto: при включённом UFW автоматически открываем выбранный порт MTProto.
+# 3) Aliases: гарантированно создаём ~/.bash_aliases и проверяем запись; ~/.bashrc уже умеет его подключать, но добавим маркер-блок при отсутствии.
+# 4) Логирование: каждое действие пишет OK/WARN, чтобы было видно, где остановка.
 
 LOG_FILE="/var/log/bootstrap_start2.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -98,7 +97,6 @@ ensure_run_sshd_dir() {
 }
 
 append_block_once() {
-  # добавляет многострочный блок в файл 1 раз (по маркеру)
   local file="$1" marker="$2" block="$3"
   touch "$file"
   if ! grep -qF "$marker" "$file"; then
@@ -110,16 +108,17 @@ append_block_once() {
 
 # ---------------- actions ----------------
 install_basics() {
+  ok "Шаг: install_basics"
   apt update
   apt upgrade -y
-  apt install -y curl mc git nano openssl bash
+  apt install -y curl mc git nano openssl bash ca-certificates gnupg
   ok "Базовые пакеты установлены/обновлены"
 }
 
 create_user() {
+  ok "Шаг: create_user"
   if ! id "$NEW_USER" &>/dev/null; then
-    # ИНТЕРАКТИВНО (как у Ubuntu по умолчанию): попросит пароль, Full Name и т.д.
-    # Это решает проблему sudo-пароля для новичка.
+    # интерактивно: спросит пароль и GECOS
     adduser "$NEW_USER"
     ok "Пользователь создан: $NEW_USER"
   else
@@ -131,6 +130,7 @@ create_user() {
 }
 
 setup_keys() {
+  ok "Шаг: setup_keys"
   [[ -n "$PUBLIC_KEY" ]] || die "SSH-ключ обязателен."
   valid_key "$PUBLIC_KEY" || die "Некорректный SSH-ключ (ssh-ed25519/ssh-rsa одной строкой)."
 
@@ -149,6 +149,7 @@ setup_keys() {
 }
 
 configure_ssh() {
+  ok "Шаг: configure_ssh"
   local f="/etc/ssh/sshd_config"
   local backup
   backup="$(backup_file_must "$f")"
@@ -183,6 +184,7 @@ configure_ssh() {
 }
 
 setup_ufw() {
+  ok "Шаг: setup_ufw"
   apt install -y ufw
   ufw default deny incoming
   ufw default allow outgoing
@@ -191,12 +193,19 @@ setup_ufw() {
   [[ "$OPEN_443" == y ]] && ufw allow 443/tcp
   [[ "$OPEN_22"  == y ]] && ufw allow 22/tcp
 
+  # Если MTProto включён — откроем порт сразу, чтобы сервис был доступен извне
+  if [[ "${INSTALL_MTPROTO:-n}" == y ]]; then
+    ufw allow "${MTPROTO_PORT}/tcp"
+    ok "UFW: открыт порт MTProto ${MTPROTO_PORT}/tcp"
+  fi
+
   ufw --force enable
-  ufw status
+  ufw status verbose
   ok "UFW включён и настроен"
 }
 
 setup_fail2ban() {
+  ok "Шаг: setup_fail2ban"
   apt install -y fail2ban
   systemctl enable --now fail2ban
 
@@ -218,37 +227,73 @@ EOF
 
   [[ -n "$ALLOW_IP" ]] && echo "ignoreip = $ALLOW_IP" >> "$f"
 
-  systemctl restart fail2ban
-  fail2ban-client ping >/dev/null 2>&1 && ok "Fail2ban активен" || warn "Fail2ban установлен, но ping не прошёл"
+  systemctl restart fail2ban || true
+  if fail2ban-client ping >/dev/null 2>&1; then
+    ok "Fail2ban активен"
+  else
+    warn "Fail2ban установлен, но ping не прошёл (проверь: systemctl status fail2ban)"
+  fi
 }
 
 install_docker() {
-  bash <(curl -sSL https://get.docker.com)
-  systemctl is-active docker >/dev/null 2>&1 && ok "Docker daemon активен" || warn "Docker установлен, но daemon не активен"
+  ok "Шаг: install_docker"
 
-  apt update
-  apt install -y docker.io docker-compose
+  # Установка Docker (официальный способ через get.docker.com)
+  # ВАЖНО: НЕ ставим потом docker.io/containerd из Ubuntu — это и вызвало конфликт containerd.io vs containerd.
+  curl -fsSL https://get.docker.com | sh
+
+  systemctl enable --now docker
+  if systemctl is-active docker >/dev/null 2>&1; then
+    ok "Docker daemon активен"
+  else
+    die "Docker установлен, но daemon не активен (systemctl status docker)"
+  fi
+
+  # docker compose plugin (из Docker repo, не docker-compose пакет Ubuntu)
+  apt-get update
+  apt-get install -y docker-compose-plugin
 
   if [[ "$ADD_DOCKER_GROUP" == y ]]; then
     usermod -aG docker "$NEW_USER" || warn "Не удалось добавить $NEW_USER в группу docker"
-    ok "Пользователь добавлен в группу docker (нужен новый вход)"
+    ok "Пользователь добавлен в группу docker (нужен новый вход в сессию)"
   fi
 }
 
 install_mtproto() {
+  ok "Шаг: install_mtproto"
   command -v docker >/dev/null 2>&1 || die "MTProto требует Docker (docker не найден)."
 
-  ss -lnt | awk '{print $4}' | grep -qE ":${MTPROTO_PORT}\$" && die "Порт $MTPROTO_PORT занят."
+  # проверка порта на занятость на хосте
+  if ss -lnt | awk '{print $4}' | grep -qE ":${MTPROTO_PORT}\$"; then
+    die "Порт $MTPROTO_PORT занят на хосте. Выберите другой."
+  fi
 
-  docker pull telegrammessenger/proxy
-  docker run -d -p "${MTPROTO_PORT}:443" --name mtproto-proxy --restart=always -v proxy-config:/data telegrammessenger/proxy:latest
+  # idempotent: если контейнер уже есть — не создаём второй
+  if docker ps -a --format '{{.Names}}' | grep -qx 'mtproto-proxy'; then
+    warn "Контейнер mtproto-proxy уже существует. Пропускаю создание."
+    docker start mtproto-proxy || true
+  else
+    docker pull telegrammessenger/proxy:latest
+    docker run -d \
+      --name mtproto-proxy \
+      --restart=always \
+      -p "${MTPROTO_PORT}:443" \
+      -v proxy-config:/data \
+      telegrammessenger/proxy:latest
+  fi
 
-  docker ps | grep -q mtproto-proxy && ok "MTProto контейнер запущен" || warn "mtproto-proxy не виден в docker ps"
+  if docker ps --format '{{.Names}}' | grep -qx 'mtproto-proxy'; then
+    ok "MTProto контейнер запущен (порт ${MTPROTO_PORT} -> 443)"
+  else
+    warn "Контейнер mtproto-proxy не запущен. Проверь: docker logs mtproto-proxy"
+  fi
+
   echo "Логи MTProto (secret/link):"
   docker logs mtproto-proxy || true
 }
 
 add_aliases() {
+  ok "Шаг: add_aliases"
   local home bashrc aliases_file marker block
 
   home="$(getent passwd "$NEW_USER" | cut -d: -f6)"
@@ -257,15 +302,12 @@ add_aliases() {
   bashrc="$home/.bashrc"
   aliases_file="$home/.bash_aliases"
 
-  # 1) Пишем алиасы строго в ~/.bash_aliases
+  # 1) Создать/обновить ~/.bash_aliases
   backup_file_if_exists "$aliases_file" && ok "Сделан бэкап $aliases_file" || true
-  touch "$aliases_file"
-  chown "$NEW_USER:$NEW_USER" "$aliases_file"
-  chmod 644 "$aliases_file"
+  install -m 644 -o "$NEW_USER" -g "$NEW_USER" /dev/null "$aliases_file"
 
   add_alias_line() {
     local name="$1" value="$2"
-    # не дублируем
     grep -qE "^alias[[:space:]]+$name=" "$aliases_file" || echo "alias $name=\"$value\"" >> "$aliases_file"
   }
 
@@ -275,21 +317,22 @@ add_aliases() {
   add_alias_line ctop       "sudo docker run --rm -ti -v /var/run/docker.sock:/var/run/docker.sock:ro quay.io/vektorlab/ctop:latest"
   add_alias_line watchtower "sudo docker run --rm -v /var/run/docker.sock:/var/run/docker.sock nickfedor/watchtower --run-once --cleanup"
 
-  # 2) Гарантируем, что ~/.bashrc подключает ~/.bash_aliases (у некоторых образов это может отсутствовать)
+  # 2) Гарантировать подключение ~/.bash_aliases из ~/.bashrc (на некоторых образах может отличаться)
   marker="# --- bootstrap: load .bash_aliases ---"
   block='if [ -f ~/.bash_aliases ]; then
   . ~/.bash_aliases
 fi'
   backup_file_if_exists "$bashrc" && ok "Сделан бэкап $bashrc" || true
-  append_block_once "$bashrc" "$marker" "$block" && ok "Добавлено подключение ~/.bash_aliases в ~/.bashrc" || ok "Подключение ~/.bash_aliases уже есть в ~/.bashrc"
+  append_block_once "$bashrc" "$marker" "$block" && ok "Добавлено подключение ~/.bash_aliases в ~/.bashrc" || true
   chown "$NEW_USER:$NEW_USER" "$bashrc"
 
-  # 3) Жёсткая проверка, что строки реально попали в ~/.bash_aliases
-  if ! grep -qE "^alias[[:space:]]+update=" "$aliases_file"; then
+  # 3) Проверка: alias update обязан быть в файле
+  if ! grep -qE '^alias[[:space:]]+update=' "$aliases_file"; then
     die "Алиасы не записались в $aliases_file (проверка не прошла)."
   fi
 
-  ok "Алиасы добавлены в $aliases_file (активируются после нового входа или: source ~/.bashrc)"
+  ok "Алиасы добавлены в $aliases_file"
+  ok "Для активации: новый вход или 'source ~/.bashrc' под пользователем $NEW_USER"
 }
 
 # ---------------- input ----------------
@@ -315,6 +358,17 @@ valid_key "$PUBLIC_KEY" || die "Некорректный SSH-ключ."
 
 ALLOW_IP="$(ask_optional "IP для ignoreip в fail2ban")"
 
+# MTProto: строгое условие + default = y
+INSTALL_MTPROTO="$(ask_yesno "Установить MTProto proxy" y)"
+MTPROTO_PORT="1243"
+if [[ "$INSTALL_MTPROTO" == y ]]; then
+  while true; do
+    MTPROTO_PORT="$(ask_default "Порт для MTProto" "1243")"
+    is_port "$MTPROTO_PORT" && break
+    echo "Некорректный порт."
+  done
+fi
+
 ENABLE_UFW="$(ask_yesno "Включить UFW" y)"
 OPEN_443=n
 OPEN_22=n
@@ -330,22 +384,11 @@ if [[ "$INSTALL_DOCKER" == y ]]; then
   ADD_DOCKER_GROUP="$(ask_yesno "Добавить пользователя в группу docker" y)"
 fi
 
-# MTProto: строгое условие + default = y
-INSTALL_MTPROTO="$(ask_yesno "Установить MTProto proxy" y)"
-MTPROTO_PORT="1243"
-if [[ "$INSTALL_MTPROTO" == y ]]; then
-  while true; do
-    MTPROTO_PORT="$(ask_default "Порт для MTProto" "1243")"
-    is_port "$MTPROTO_PORT" && break
-    echo "Некорректный порт."
-  done
-fi
-
 ADD_ALIASES="$(ask_yesno "Добавить полезные алиасы новому пользователю" y)"
 
 echo
 echo "=== План ==="
-echo "User: $NEW_USER | SSH port: $NEW_SSH_PORT | UFW: $ENABLE_UFW | Fail2ban: $INSTALL_F2B | Docker: $INSTALL_DOCKER | MTProto: $INSTALL_MTPROTO | Aliases: $ADD_ALIASES"
+echo "User: $NEW_USER | SSH port: $NEW_SSH_PORT | UFW: $ENABLE_UFW | Fail2ban: $INSTALL_F2B | Docker: $INSTALL_DOCKER | MTProto: $INSTALL_MTPROTO | MTProto port: $MTPROTO_PORT | Aliases: $ADD_ALIASES"
 echo
 
 [[ "$(ask_yesno "Продолжить" y)" == y ]] || die "Остановлено пользователем"
@@ -365,4 +408,5 @@ echo
 echo "=== Готово ==="
 echo "Вход: ssh -p $NEW_SSH_PORT $NEW_USER@<IP_СЕРВЕРА>"
 echo "Лог: $LOG_FILE"
-echo "Алиасы (если включали): source ~/.bashrc (или новый вход)"
+echo "Если включали MTProto: порт ${MTPROTO_PORT}/tcp открыт в UFW (если UFW включали)"
+echo "Алиасы (если включали): новый вход или 'source ~/.bashrc'"
