@@ -4,12 +4,13 @@ set -Eeuo pipefail
 # bootstrap.sh — Ubuntu 24.04, старт: root по SSH
 # Авто: user+sudo, SSH hardening, (опц.) UFW, (опц.) fail2ban, (опц.) Docker, (опц.) MTProto, (опц.) aliases
 #
-# Ключевые моменты:
-# - Пользователь создаётся НЕинтерактивно: adduser --disabled-password --gecos ""
-# - Перед sshd -t создаётся /run/sshd (исправляет "Missing privilege separation directory: /run/sshd")
+# ИСПРАВЛЕНИЯ:
+# - Пользователь создаётся с паролем (НЕ disabled-password): пароль задаётся через диалог adduser
+# - /run/sshd создаётся перед sshd -t (фикс "Missing privilege separation directory")
 # - sshd_config: бэкап + откат при ошибке проверки/рестарта
-# - MTProto: вопрос по умолчанию = y, порт спрашивается только если MTProto = y
-# - Алиасы: пишутся в ~/.bash_aliases (стандартный путь)
+# - MTProto: default = y, порт спрашивается только если MTProto = y
+# - Алиасы: пишутся в ~/.bash_aliases (правильный файл); гарантируется подключение из ~/.bashrc
+# - После добавления алиасов — принудительная проверка наличия строк
 
 LOG_FILE="/var/log/bootstrap_start2.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -57,7 +58,7 @@ ask_yesno() {
 
 is_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( 1 <= $1 && $1 <= 65535 )); }
 valid_user() { [[ "$1" =~ ^[a-z_][a-z0-9_-]*$ ]] && [[ "$1" != "root" ]]; }
-valid_key() { [[ "$1" =~ ^ssh-(ed25519|rsa)[[:space:]][A-Za-z0-9+/=]+([[:space:]].*)?$ ]]; }
+valid_key()  { [[ "$1" =~ ^ssh-(ed25519|rsa)[[:space:]][A-Za-z0-9+/=]+([[:space:]].*)?$ ]]; }
 
 backup_file_if_exists() {
   local f="$1"
@@ -96,6 +97,17 @@ ensure_run_sshd_dir() {
   chmod 0755 /run/sshd
 }
 
+append_block_once() {
+  # добавляет многострочный блок в файл 1 раз (по маркеру)
+  local file="$1" marker="$2" block="$3"
+  touch "$file"
+  if ! grep -qF "$marker" "$file"; then
+    printf "\n%s\n%s\n" "$marker" "$block" >> "$file"
+    return 0
+  fi
+  return 1
+}
+
 # ---------------- actions ----------------
 install_basics() {
   apt update
@@ -106,8 +118,9 @@ install_basics() {
 
 create_user() {
   if ! id "$NEW_USER" &>/dev/null; then
-    # Неинтерактивно: пароль не задаём (вход по ключу), GECOS пустой
-    adduser --disabled-password --gecos "" "$NEW_USER"
+    # ИНТЕРАКТИВНО (как у Ubuntu по умолчанию): попросит пароль, Full Name и т.д.
+    # Это решает проблему sudo-пароля для новичка.
+    adduser "$NEW_USER"
     ok "Пользователь создан: $NEW_USER"
   else
     ok "Пользователь уже существует: $NEW_USER"
@@ -118,7 +131,7 @@ create_user() {
 }
 
 setup_keys() {
-  [[ -n "$PUBLIC_KEY" ]] || die "SSH-ключ обязателен. Нельзя продолжать."
+  [[ -n "$PUBLIC_KEY" ]] || die "SSH-ключ обязателен."
   valid_key "$PUBLIC_KEY" || die "Некорректный SSH-ключ (ssh-ed25519/ssh-rsa одной строкой)."
 
   local home
@@ -147,7 +160,6 @@ configure_ssh() {
   ensure_kv "$f" AuthorizedKeysFile ".ssh/authorized_keys"
   ensure_kv "$f" Port "$NEW_SSH_PORT"
 
-  # Исправление "Missing privilege separation directory: /run/sshd"
   ensure_run_sshd_dir
 
   if ! sshd -t; then
@@ -224,10 +236,9 @@ install_docker() {
 }
 
 install_mtproto() {
-  # Проверяем docker по факту, а не по ответу диалога
   command -v docker >/dev/null 2>&1 || die "MTProto требует Docker (docker не найден)."
 
-  ss -lnt | awk '{print $4}' | grep -qE ":${MTPROTO_PORT}\$" && die "Порт $MTPROTO_PORT занят. Выберите другой."
+  ss -lnt | awk '{print $4}' | grep -qE ":${MTPROTO_PORT}\$" && die "Порт $MTPROTO_PORT занят."
 
   docker pull telegrammessenger/proxy
   docker run -d -p "${MTPROTO_PORT}:443" --name mtproto-proxy --restart=always -v proxy-config:/data telegrammessenger/proxy:latest
@@ -238,19 +249,23 @@ install_mtproto() {
 }
 
 add_aliases() {
-  local home aliases_file
+  local home bashrc aliases_file marker block
+
   home="$(getent passwd "$NEW_USER" | cut -d: -f6)"
   [[ -n "$home" && -d "$home" ]] || die "Не найден home для пользователя $NEW_USER"
 
+  bashrc="$home/.bashrc"
   aliases_file="$home/.bash_aliases"
-  backup_file_if_exists "$aliases_file" && ok "Сделан бэкап $aliases_file" || true
 
+  # 1) Пишем алиасы строго в ~/.bash_aliases
+  backup_file_if_exists "$aliases_file" && ok "Сделан бэкап $aliases_file" || true
   touch "$aliases_file"
   chown "$NEW_USER:$NEW_USER" "$aliases_file"
   chmod 644 "$aliases_file"
 
   add_alias_line() {
     local name="$1" value="$2"
+    # не дублируем
     grep -qE "^alias[[:space:]]+$name=" "$aliases_file" || echo "alias $name=\"$value\"" >> "$aliases_file"
   }
 
@@ -260,7 +275,21 @@ add_aliases() {
   add_alias_line ctop       "sudo docker run --rm -ti -v /var/run/docker.sock:/var/run/docker.sock:ro quay.io/vektorlab/ctop:latest"
   add_alias_line watchtower "sudo docker run --rm -v /var/run/docker.sock:/var/run/docker.sock nickfedor/watchtower --run-once --cleanup"
 
-  ok "Алиасы добавлены в $aliases_file"
+  # 2) Гарантируем, что ~/.bashrc подключает ~/.bash_aliases (у некоторых образов это может отсутствовать)
+  marker="# --- bootstrap: load .bash_aliases ---"
+  block='if [ -f ~/.bash_aliases ]; then
+  . ~/.bash_aliases
+fi'
+  backup_file_if_exists "$bashrc" && ok "Сделан бэкап $bashrc" || true
+  append_block_once "$bashrc" "$marker" "$block" && ok "Добавлено подключение ~/.bash_aliases в ~/.bashrc" || ok "Подключение ~/.bash_aliases уже есть в ~/.bashrc"
+  chown "$NEW_USER:$NEW_USER" "$bashrc"
+
+  # 3) Жёсткая проверка, что строки реально попали в ~/.bash_aliases
+  if ! grep -qE "^alias[[:space:]]+update=" "$aliases_file"; then
+    die "Алиасы не записались в $aliases_file (проверка не прошла)."
+  fi
+
+  ok "Алиасы добавлены в $aliases_file (активируются после нового входа или: source ~/.bashrc)"
 }
 
 # ---------------- input ----------------
@@ -301,7 +330,7 @@ if [[ "$INSTALL_DOCKER" == y ]]; then
   ADD_DOCKER_GROUP="$(ask_yesno "Добавить пользователя в группу docker" y)"
 fi
 
-# --- MTProto: строгое условие + default = y ---
+# MTProto: строгое условие + default = y
 INSTALL_MTPROTO="$(ask_yesno "Установить MTProto proxy" y)"
 MTPROTO_PORT="1243"
 if [[ "$INSTALL_MTPROTO" == y ]]; then
@@ -311,7 +340,6 @@ if [[ "$INSTALL_MTPROTO" == y ]]; then
     echo "Некорректный порт."
   done
 fi
-# ------------------------------------------------
 
 ADD_ALIASES="$(ask_yesno "Добавить полезные алиасы новому пользователю" y)"
 
@@ -337,4 +365,4 @@ echo
 echo "=== Готово ==="
 echo "Вход: ssh -p $NEW_SSH_PORT $NEW_USER@<IP_СЕРВЕРА>"
 echo "Лог: $LOG_FILE"
-echo "Алиасы (если включали): source ~/.bash_aliases (или новый вход)"
+echo "Алиасы (если включали): source ~/.bashrc (или новый вход)"
