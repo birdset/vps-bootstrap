@@ -41,4 +41,3 @@
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/birdset/vps-bootstrap/main/bootstrap.sh)
-# vps-bootstrap
