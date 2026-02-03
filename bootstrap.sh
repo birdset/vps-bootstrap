@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# bootstrap.sh — Ubuntu 24.04, старт: root по SSH
+# Авто: user+sudo, SSH hardening, (опц.) UFW, (опц.) fail2ban, (опц.) Docker, (опц.) MTProto, (опц.) aliases
+#
+# Ключевые моменты:
+# - Пользователь создаётся НЕинтерактивно: adduser --disabled-password --gecos ""
+# - Перед sshd -t создаётся /run/sshd (исправляет "Missing privilege separation directory: /run/sshd")
+# - sshd_config: бэкап + откат при ошибке проверки/рестарта
+# - MTProto: вопрос по умолчанию = y, порт спрашивается только если MTProto = y
+# - Алиасы: пишутся в ~/.bash_aliases (стандартный путь)
+
 LOG_FILE="/var/log/bootstrap_start2.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
@@ -12,7 +22,6 @@ warn(){ echo "WARN: $*"; }
 
 # ---------------- helpers ----------------
 trim() {
-  # удаляет ведущие/концевые пробелы
   local s="$1"
   s="${s#"${s%%[![:space:]]*}"}"
   s="${s%"${s##*[![:space:]]}"}"
@@ -47,9 +56,7 @@ ask_yesno() {
 }
 
 is_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( 1 <= $1 && $1 <= 65535 )); }
-
 valid_user() { [[ "$1" =~ ^[a-z_][a-z0-9_-]*$ ]] && [[ "$1" != "root" ]]; }
-
 valid_key() { [[ "$1" =~ ^ssh-(ed25519|rsa)[[:space:]][A-Za-z0-9+/=]+([[:space:]].*)?$ ]]; }
 
 backup_file_if_exists() {
@@ -78,6 +85,17 @@ ensure_kv() {
   fi
 }
 
+port_listening() {
+  local p="$1"
+  ss -lntp 2>/dev/null | grep -qE ":${p}\b"
+}
+
+ensure_run_sshd_dir() {
+  mkdir -p /run/sshd
+  chown root:root /run/sshd
+  chmod 0755 /run/sshd
+}
+
 # ---------------- actions ----------------
 install_basics() {
   apt update
@@ -88,11 +106,13 @@ install_basics() {
 
 create_user() {
   if ! id "$NEW_USER" &>/dev/null; then
-    adduser "$NEW_USER"
+    # Неинтерактивно: пароль не задаём (вход по ключу), GECOS пустой
+    adduser --disabled-password --gecos "" "$NEW_USER"
     ok "Пользователь создан: $NEW_USER"
   else
     ok "Пользователь уже существует: $NEW_USER"
   fi
+
   usermod -aG sudo "$NEW_USER"
   ok "Пользователь добавлен в sudo: $NEW_USER"
 }
@@ -127,6 +147,9 @@ configure_ssh() {
   ensure_kv "$f" AuthorizedKeysFile ".ssh/authorized_keys"
   ensure_kv "$f" Port "$NEW_SSH_PORT"
 
+  # Исправление "Missing privilege separation directory: /run/sshd"
+  ensure_run_sshd_dir
+
   if ! sshd -t; then
     cp -a "$backup" "$f"
     die "sshd -t не прошёл. Откат на бэкап выполнен."
@@ -138,11 +161,13 @@ configure_ssh() {
     die "Не удалось перезапустить SSH. Откат на бэкап выполнен."
   fi
 
-  if ss -lntp | grep -qE ":$NEW_SSH_PORT\b"; then
+  if port_listening "$NEW_SSH_PORT"; then
     ok "sshd слушает порт $NEW_SSH_PORT"
   else
-    warn "Не вижу прослушивание порта $NEW_SSH_PORT (ss -lntp)."
+    warn "Не вижу, что sshd слушает порт $NEW_SSH_PORT. Проверь: ss -lntp | grep sshd"
   fi
+
+  ok "SSH настроен"
 }
 
 setup_ufw() {
@@ -180,6 +205,7 @@ port = ssh
 EOF
 
   [[ -n "$ALLOW_IP" ]] && echo "ignoreip = $ALLOW_IP" >> "$f"
+
   systemctl restart fail2ban
   fail2ban-client ping >/dev/null 2>&1 && ok "Fail2ban активен" || warn "Fail2ban установлен, но ping не прошёл"
 }
@@ -198,12 +224,14 @@ install_docker() {
 }
 
 install_mtproto() {
+  # Проверяем docker по факту, а не по ответу диалога
   command -v docker >/dev/null 2>&1 || die "MTProto требует Docker (docker не найден)."
 
-  ss -lnt | awk '{print $4}' | grep -qE ":${MTPROTO_PORT}\$" && die "Порт $MTPROTO_PORT занят."
+  ss -lnt | awk '{print $4}' | grep -qE ":${MTPROTO_PORT}\$" && die "Порт $MTPROTO_PORT занят. Выберите другой."
 
   docker pull telegrammessenger/proxy
   docker run -d -p "${MTPROTO_PORT}:443" --name mtproto-proxy --restart=always -v proxy-config:/data telegrammessenger/proxy:latest
+
   docker ps | grep -q mtproto-proxy && ok "MTProto контейнер запущен" || warn "mtproto-proxy не виден в docker ps"
   echo "Логи MTProto (secret/link):"
   docker logs mtproto-proxy || true
@@ -273,8 +301,8 @@ if [[ "$INSTALL_DOCKER" == y ]]; then
   ADD_DOCKER_GROUP="$(ask_yesno "Добавить пользователя в группу docker" y)"
 fi
 
-# --- MTProto: строгое условие (как требовалось) ---
-INSTALL_MTPROTO="$(ask_yesno "Установить MTProto proxy" n)"
+# --- MTProto: строгое условие + default = y ---
+INSTALL_MTPROTO="$(ask_yesno "Установить MTProto proxy" y)"
 MTPROTO_PORT="1243"
 if [[ "$INSTALL_MTPROTO" == y ]]; then
   while true; do
@@ -283,7 +311,7 @@ if [[ "$INSTALL_MTPROTO" == y ]]; then
     echo "Некорректный порт."
   done
 fi
-# -------------------------------------------------
+# ------------------------------------------------
 
 ADD_ALIASES="$(ask_yesno "Добавить полезные алиасы новому пользователю" y)"
 
