@@ -21,6 +21,20 @@ warn(){ echo "WARN: $*"; }
 [[ "$(id -u)" -eq 0 ]] || die "Запустите скрипт от root."
 
 # ---------------- helpers ----------------
+APT_UPDATED=0
+
+apt_update_once() {
+  if (( APT_UPDATED == 0 )); then
+    apt-get update
+    APT_UPDATED=1
+  fi
+}
+
+apt_install() {
+  apt_update_once
+  apt-get install -y "$@"
+}
+
 trim() {
   local s="$1"
   s="${s#"${s%%[![:space:]]*}"}"
@@ -109,9 +123,9 @@ append_block_once() {
 # ---------------- actions ----------------
 install_basics() {
   ok "Шаг: install_basics"
-  apt update
-  apt upgrade -y
-  apt install -y curl mc git nano openssl bash ca-certificates gnupg
+  apt_update_once
+  apt-get upgrade -y
+  apt_install curl mc git nano openssl bash ca-certificates gnupg
   ok "Базовые пакеты установлены/обновлены"
 }
 
@@ -185,7 +199,7 @@ configure_ssh() {
 
 setup_ufw() {
   ok "Шаг: setup_ufw"
-  apt install -y ufw
+  apt_install ufw
   ufw default deny incoming
   ufw default allow outgoing
 
@@ -206,7 +220,7 @@ setup_ufw() {
 
 setup_fail2ban() {
   ok "Шаг: setup_fail2ban"
-  apt install -y fail2ban
+  apt_install fail2ban
   systemctl enable --now fail2ban
 
   local f="/etc/fail2ban/jail.d/sshd.local"
@@ -250,8 +264,7 @@ install_docker() {
   fi
 
   # docker compose plugin (из Docker repo, не docker-compose пакет Ubuntu)
-  apt-get update
-  apt-get install -y docker-compose-plugin
+  apt_install docker-compose-plugin
 
   if [[ "$ADD_DOCKER_GROUP" == y ]]; then
     usermod -aG docker "$NEW_USER" || warn "Не удалось добавить $NEW_USER в группу docker"
