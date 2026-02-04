@@ -132,8 +132,8 @@ install_basics() {
 create_user() {
   ok "Шаг: create_user"
   if ! id "$NEW_USER" &>/dev/null; then
-    # интерактивно: спросит пароль и GECOS
-    adduser "$NEW_USER"
+    useradd -m -s /bin/bash "$NEW_USER"
+    passwd "$NEW_USER"
     ok "Пользователь создан: $NEW_USER"
   else
     ok "Пользователь уже существует: $NEW_USER"
@@ -359,52 +359,28 @@ while true; do
   echo "Некорректное имя (не root, латиница/цифры/_/-)."
 done
 
-while true; do
-  NEW_SSH_PORT="$(ask_default "Новый порт SSH" "4422")"
-  is_port "$NEW_SSH_PORT" && break
-  echo "Некорректный порт."
-done
-
 PUBLIC_KEY="$(ask_optional "Вставьте публичный SSH-ключ одной строкой")"
 [[ -n "$PUBLIC_KEY" ]] || die "SSH-ключ обязателен."
 valid_key "$PUBLIC_KEY" || die "Некорректный SSH-ключ."
 
-ALLOW_IP="$(ask_optional "IP для ignoreip в fail2ban")"
-
-# MTProto: строгое условие + default = y
-INSTALL_MTPROTO="$(ask_yesno "Установить MTProto proxy" y)"
+NEW_SSH_PORT="4422"
+ALLOW_IP=""
+INSTALL_MTPROTO="y"
 MTPROTO_PORT="1243"
-if [[ "$INSTALL_MTPROTO" == y ]]; then
-  while true; do
-    MTPROTO_PORT="$(ask_default "Порт для MTProto" "1243")"
-    is_port "$MTPROTO_PORT" && break
-    echo "Некорректный порт."
-  done
-fi
-
-ENABLE_UFW="$(ask_yesno "Включить UFW" y)"
-OPEN_443=n
-OPEN_22=n
-if [[ "$ENABLE_UFW" == y ]]; then
-  OPEN_443="$(ask_yesno "Открыть порт 443/tcp" y)"
-  OPEN_22="$(ask_yesno "Открыть порт 22/tcp (НЕ рекомендуется)" n)"
-fi
-
-INSTALL_F2B="$(ask_yesno "Установить fail2ban" y)"
-INSTALL_DOCKER="$(ask_yesno "Установить Docker" y)"
-ADD_DOCKER_GROUP=n
-if [[ "$INSTALL_DOCKER" == y ]]; then
-  ADD_DOCKER_GROUP="$(ask_yesno "Добавить пользователя в группу docker" y)"
-fi
-
-ADD_ALIASES="$(ask_yesno "Добавить полезные алиасы новому пользователю" y)"
+ENABLE_UFW="y"
+OPEN_443="y"
+OPEN_22="y"
+INSTALL_F2B="y"
+INSTALL_DOCKER="y"
+ADD_DOCKER_GROUP="y"
+ADD_ALIASES="y"
 
 echo
 echo "=== План ==="
 echo "User: $NEW_USER | SSH port: $NEW_SSH_PORT | UFW: $ENABLE_UFW | Fail2ban: $INSTALL_F2B | Docker: $INSTALL_DOCKER | MTProto: $INSTALL_MTPROTO | MTProto port: $MTPROTO_PORT | Aliases: $ADD_ALIASES"
 echo
 
-[[ "$(ask_yesno "Продолжить" y)" == y ]] || die "Остановлено пользователем"
+ok "Стартуем без дополнительных вопросов."
 
 # ---------------- run ----------------
 install_basics
