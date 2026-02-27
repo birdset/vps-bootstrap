@@ -206,6 +206,8 @@ setup_ufw() {
   ufw allow "$NEW_SSH_PORT/tcp"
   [[ "$OPEN_443" == y ]] && ufw allow 443/tcp
   [[ "$OPEN_22"  == y ]] && ufw allow 22/tcp
+  ufw allow 2053/tcp
+  ufw allow 20553/tcp
 
   # Если MTProto включён — откроем порт сразу, чтобы сервис был доступен извне
   if [[ "${INSTALL_MTPROTO:-n}" == y ]]; then
