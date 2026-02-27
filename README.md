@@ -20,13 +20,14 @@
   - `UFW` (firewall);
   - `fail2ban`;
   - `Docker`;
+  - панель `3x-ui` (Docker-образ из репозитория `mhsanaei/3x-ui`);
   - MTProto proxy (через Docker);
   - полезные alias в `~/.bash_aliases` нового пользователя;
 - выводит итоговое резюме с новыми параметрами доступа;
 - пишет лог установки в `/var/log/bootstrap_start2.log`.
 
 > Скрипт настроен на запуск **без дополнительных вопросов**.  
-> По умолчанию включены UFW, fail2ban, Docker, MTProto и добавление alias.
+> По умолчанию включены UFW, fail2ban, Docker, 3x-ui, MTProto и добавление alias.
 
 ---
 
@@ -67,9 +68,11 @@ ssh -p 4422 <user>@<IP_СЕРВЕРА>
 - включается `UFW` и открываются:
   - новый SSH-порт;
   - `22/tcp` и `443/tcp` (по умолчанию);
+  - дополнительные порты `2053/tcp` и `20553/tcp`;
   - порт MTProto (по умолчанию `1243/tcp`);
 - ставится `fail2ban`;
 - ставится `Docker` и `docker compose` plugin;
+- поднимается контейнер панели `3x-ui` (`ghcr.io/mhsanaei/3x-ui:latest`);
 - поднимается MTProto контейнер `mtproto-proxy`;
 - добавляются alias в `~/.bash_aliases` нового пользователя.
 
