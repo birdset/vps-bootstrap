@@ -305,6 +305,36 @@ install_mtproto() {
   docker logs mtproto-proxy || true
 }
 
+install_3x_ui() {
+  ok "Шаг: install_3x_ui"
+  command -v docker >/dev/null 2>&1 || die "3x-ui требует Docker (docker не найден)."
+
+  # idempotent: если контейнер уже есть — не создаём второй
+  if docker ps -a --format '{{.Names}}' | grep -qx '3x-ui'; then
+    warn "Контейнер 3x-ui уже существует. Пропускаю создание."
+    docker start 3x-ui || true
+  else
+    docker pull ghcr.io/mhsanaei/3x-ui:latest
+    docker run -d \
+      --name 3x-ui \
+      --restart unless-stopped \
+      --network host \
+      --privileged \
+      -v /etc/x-ui:/etc/x-ui \
+      -v /usr/local/x-ui:/usr/local/x-ui \
+      ghcr.io/mhsanaei/3x-ui:latest
+  fi
+
+  if docker ps --format '{{.Names}}' | grep -qx '3x-ui'; then
+    ok "3x-ui контейнер запущен"
+  else
+    warn "Контейнер 3x-ui не запущен. Проверь: docker logs 3x-ui"
+  fi
+
+  echo "Логи 3x-ui (initial setup):"
+  docker logs --tail 50 3x-ui || true
+}
+
 add_aliases() {
   ok "Шаг: add_aliases"
   local home bashrc aliases_file marker block
@@ -373,11 +403,12 @@ OPEN_22="y"
 INSTALL_F2B="y"
 INSTALL_DOCKER="y"
 ADD_DOCKER_GROUP="y"
+INSTALL_3X_UI="y"
 ADD_ALIASES="y"
 
 echo
 echo "=== План ==="
-echo "User: $NEW_USER | SSH port: $NEW_SSH_PORT | UFW: $ENABLE_UFW | Fail2ban: $INSTALL_F2B | Docker: $INSTALL_DOCKER | MTProto: $INSTALL_MTPROTO | MTProto port: $MTPROTO_PORT | Aliases: $ADD_ALIASES"
+echo "User: $NEW_USER | SSH port: $NEW_SSH_PORT | UFW: $ENABLE_UFW | Fail2ban: $INSTALL_F2B | Docker: $INSTALL_DOCKER | 3x-ui: $INSTALL_3X_UI | MTProto: $INSTALL_MTPROTO | MTProto port: $MTPROTO_PORT | Aliases: $ADD_ALIASES"
 echo
 
 ok "Стартуем без дополнительных вопросов."
@@ -390,6 +421,7 @@ configure_ssh
 [[ "$ENABLE_UFW" == y ]] && setup_ufw
 [[ "$INSTALL_F2B" == y ]] && setup_fail2ban
 [[ "$INSTALL_DOCKER" == y ]] && install_docker
+[[ "$INSTALL_DOCKER" == y && "$INSTALL_3X_UI" == y ]] && install_3x_ui
 [[ "$INSTALL_MTPROTO" == y ]] && install_mtproto
 [[ "$ADD_ALIASES" == y ]] && add_aliases
 
