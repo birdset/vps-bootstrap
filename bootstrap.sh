@@ -2,12 +2,12 @@
 set -Eeuo pipefail
 
 # bootstrap.sh — Ubuntu 24.04, старт: root по SSH
-# Авто: user+sudo, SSH hardening, (опц.) UFW, (опц.) fail2ban, (опц.) Docker, (опц.) MTProto, (опц.) aliases
+# Авто: user+sudo, SSH hardening, (опц.) UFW, (опц.) fail2ban, (опц.) Docker, (опц.) MTG, (опц.) aliases
 #
 # КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ (по вашим логам):
 # 1) Docker: убран конфликт пакетов (НЕ ставим docker.io/containerd из Ubuntu после get.docker.com).
 #    Ставим Docker через get.docker.com + docker-compose-plugin из Docker repo.
-# 2) MTProto: при включённом UFW автоматически открываем выбранный порт MTProto.
+# 2) MTG: при включённом UFW автоматически открываем выбранный порт MTG.
 # 3) Aliases: гарантированно создаём ~/.bash_aliases и проверяем запись; ~/.bashrc уже умеет его подключать, но добавим маркер-блок при отсутствии.
 # 4) Логирование: каждое действие пишет OK/WARN, чтобы было видно, где остановка.
 
@@ -209,10 +209,10 @@ setup_ufw() {
   ufw allow 2053/tcp
   ufw allow 20553/tcp
 
-  # Если MTProto включён — откроем порт сразу, чтобы сервис был доступен извне
-  if [[ "${INSTALL_MTPROTO:-n}" == y ]]; then
-    ufw allow "${MTPROTO_PORT}/tcp"
-    ok "UFW: открыт порт MTProto ${MTPROTO_PORT}/tcp"
+  # Если MTG включён — откроем порт сразу, чтобы сервис был доступен извне
+  if [[ "${INSTALL_MTG:-n}" == y ]]; then
+    ufw allow "${MTG_PORT}/tcp"
+    ok "UFW: открыт порт MTG ${MTG_PORT}/tcp"
   fi
 
   ufw --force enable
@@ -274,37 +274,36 @@ install_docker() {
   fi
 }
 
-install_mtproto() {
-  ok "Шаг: install_mtproto"
-  command -v docker >/dev/null 2>&1 || die "MTProto требует Docker (docker не найден)."
+install_mtg() {
+  ok "Шаг: install_mtg"
+  command -v docker >/dev/null 2>&1 || die "MTG требует Docker (docker не найден)."
 
   # проверка порта на занятость на хосте
-  if ss -lnt | awk '{print $4}' | grep -qE ":${MTPROTO_PORT}\$"; then
-    die "Порт $MTPROTO_PORT занят на хосте. Выберите другой."
+  if ss -lnt | awk '{print $4}' | grep -qE ":${MTG_PORT}\$"; then
+    die "Порт $MTG_PORT занят на хосте. Выберите другой."
   fi
 
   # idempotent: если контейнер уже есть — не создаём второй
-  if docker ps -a --format '{{.Names}}' | grep -qx 'mtproto-proxy'; then
-    warn "Контейнер mtproto-proxy уже существует. Пропускаю создание."
-    docker start mtproto-proxy || true
+  if docker ps -a --format '{{.Names}}' | grep -qx 'mtg-proxy'; then
+    warn "Контейнер mtg-proxy уже существует. Пропускаю создание."
+    docker start mtg-proxy || true
   else
-    docker pull telegrammessenger/proxy:latest
+    docker pull nineseconds/mtg:latest
     docker run -d \
-      --name mtproto-proxy \
+      --name mtg-proxy \
       --restart=always \
-      -p "${MTPROTO_PORT}:443" \
-      -v proxy-config:/data \
-      telegrammessenger/proxy:latest
+      -p "${MTG_PORT}:3128" \
+      nineseconds/mtg:latest run "$(openssl rand -hex 16)"
   fi
 
-  if docker ps --format '{{.Names}}' | grep -qx 'mtproto-proxy'; then
-    ok "MTProto контейнер запущен (порт ${MTPROTO_PORT} -> 443)"
+  if docker ps --format '{{.Names}}' | grep -qx 'mtg-proxy'; then
+    ok "MTG контейнер запущен (порт ${MTG_PORT} -> 3128)"
   else
-    warn "Контейнер mtproto-proxy не запущен. Проверь: docker logs mtproto-proxy"
+    warn "Контейнер mtg-proxy не запущен. Проверь: docker logs mtg-proxy"
   fi
 
-  echo "Логи MTProto (secret/link):"
-  docker logs mtproto-proxy || true
+  echo "Логи MTG:"
+  docker logs mtg-proxy || true
 }
 
 install_3x_ui() {
@@ -397,8 +396,8 @@ valid_key "$PUBLIC_KEY" || die "Некорректный SSH-ключ."
 
 NEW_SSH_PORT="4422"
 ALLOW_IP=""
-INSTALL_MTPROTO="y"
-MTPROTO_PORT="1243"
+INSTALL_MTG="y"
+MTG_PORT="1243"
 ENABLE_UFW="y"
 OPEN_443="y"
 OPEN_22="y"
@@ -410,7 +409,7 @@ ADD_ALIASES="y"
 
 echo
 echo "=== План ==="
-echo "User: $NEW_USER | SSH port: $NEW_SSH_PORT | UFW: $ENABLE_UFW | Fail2ban: $INSTALL_F2B | Docker: $INSTALL_DOCKER | 3x-ui: $INSTALL_3X_UI | MTProto: $INSTALL_MTPROTO | MTProto port: $MTPROTO_PORT | Aliases: $ADD_ALIASES"
+echo "User: $NEW_USER | SSH port: $NEW_SSH_PORT | UFW: $ENABLE_UFW | Fail2ban: $INSTALL_F2B | Docker: $INSTALL_DOCKER | 3x-ui: $INSTALL_3X_UI | MTG: $INSTALL_MTG | MTG port: $MTG_PORT | Aliases: $ADD_ALIASES"
 echo
 
 ok "Стартуем без дополнительных вопросов."
@@ -424,12 +423,12 @@ configure_ssh
 [[ "$INSTALL_F2B" == y ]] && setup_fail2ban
 [[ "$INSTALL_DOCKER" == y ]] && install_docker
 [[ "$INSTALL_DOCKER" == y && "$INSTALL_3X_UI" == y ]] && install_3x_ui
-[[ "$INSTALL_MTPROTO" == y ]] && install_mtproto
+[[ "$INSTALL_MTG" == y ]] && install_mtg
 [[ "$ADD_ALIASES" == y ]] && add_aliases
 
 echo
 echo "=== Готово ==="
 echo "Вход: ssh -p $NEW_SSH_PORT $NEW_USER@<IP_СЕРВЕРА>"
 echo "Лог: $LOG_FILE"
-echo "Если включали MTProto: порт ${MTPROTO_PORT}/tcp открыт в UFW (если UFW включали)"
+echo "Если включали MTG: порт ${MTG_PORT}/tcp открыт в UFW (если UFW включали)"
 echo "Алиасы (если включали): новый вход или 'source ~/.bashrc'"

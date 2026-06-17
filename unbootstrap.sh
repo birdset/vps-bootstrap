@@ -174,9 +174,8 @@ remove_fail2ban() {
 remove_docker() {
   if command -v docker >/dev/null 2>&1; then
     ok "Останавливаем Docker и контейнеры"
-    docker rm -f mtproto-proxy >/dev/null 2>&1 || true
+    docker rm -f mtg-proxy >/dev/null 2>&1 || true
     docker rm -f 3x-ui >/dev/null 2>&1 || true
-    docker volume rm proxy-config >/dev/null 2>&1 || true
     rm -rf /etc/x-ui /usr/local/x-ui || true
     systemctl disable --now docker || true
   fi
