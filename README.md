@@ -21,13 +21,13 @@
   - `fail2ban`;
   - `Docker`;
   - панель `3x-ui` (Docker-образ из репозитория `mhsanaei/3x-ui`);
-  - MTProto proxy (через Docker);
+  - MTG proxy (через Docker);
   - полезные alias в `~/.bash_aliases` нового пользователя;
 - 🧾 выводит итоговое резюме с новыми параметрами доступа;
 - 📄 пишет лог установки в `/var/log/bootstrap_start2.log`.
 
 > Скрипт настроен на запуск **без дополнительных вопросов**.  
-> По умолчанию включены UFW, fail2ban, Docker, 3x-ui, MTProto и добавление alias.
+> По умолчанию включены UFW, fail2ban, Docker, 3x-ui, MTG и добавление alias.
 
 ---
 
@@ -69,11 +69,11 @@ ssh -p 4422 <user>@<IP_СЕРВЕРА>
   - новый SSH-порт;
   - `22/tcp` и `443/tcp` (по умолчанию);
   - дополнительные порты `2053/tcp` и `20553/tcp`;
-  - порт MTProto (по умолчанию `1243/tcp`);
+  - порт MTG (по умолчанию `1243/tcp`);
 - ставится `fail2ban`;
 - ставится `Docker` и `docker compose` plugin;
 - поднимается контейнер панели `3x-ui` (`ghcr.io/mhsanaei/3x-ui:latest`);
-- поднимается MTProto контейнер `mtproto-proxy`;
+- поднимается MTG контейнер `mtg-proxy`;
 - добавляются alias в `~/.bash_aliases` нового пользователя.
 
 ---
@@ -94,7 +94,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/birdset/vps-bootstrap/main/u
 - 🗑️ удаляет созданного пользователя;
 - 🔧 восстанавливает конфигурацию SSH (из бэкапа, если он есть);
 - 🧹 отключает и удаляет UFW, fail2ban и Docker;
-- 🐳 удаляет контейнеры `mtproto-proxy` и `3x-ui`;
+- 🐳 удаляет контейнеры `mtg-proxy` и `3x-ui`;
 - 📁 удаляет директории данных `3x-ui` (`/etc/x-ui`, `/usr/local/x-ui`);
 - 📄 удаляет логи bootstrap.
 
