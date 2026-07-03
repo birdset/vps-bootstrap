@@ -126,7 +126,7 @@ install_basics() {
   ok "Шаг: install_basics"
   apt_update_once
   apt-get upgrade -y
-  apt_install curl mc git nano openssl bash ca-certificates gnupg jq
+  apt_install curl mc git nano openssl bash ca-certificates gnupg jq nftables
   ok "Базовые пакеты установлены/обновлены"
 }
 
@@ -306,6 +306,11 @@ install_telemt() {
 [general]
 use_middle_proxy = true
 log_level = "normal"
+tg_connect = 10
+
+[timeouts]
+client_handshake = 15
+client_keepalive = 60
 
 [general.modes]
 classic = false
@@ -393,6 +398,112 @@ EOF
 
   echo "Ссылка Telemt для подключения:"
   curl -fsS http://127.0.0.1:9091/v1/users 2>/dev/null | jq -r '.data[] | "[\(.username)]", (.links.tls[]? | "tls: \(.)"), ""' || warn "Не удалось получить ссылку через API. Проверь позже: curl -s http://127.0.0.1:9091/v1/users"
+}
+
+setup_telemt_tuning() {
+  ok "Шаг: setup_telemt_tuning"
+  command -v nft >/dev/null 2>&1 || die "Для настройки Telemt требуется nftables (nft не найден)."
+  command -v docker >/dev/null 2>&1 || die "Для настройки Telemt требуется Docker (docker не найден)."
+
+  cat > /usr/local/sbin/telemt-in-syn-limit.sh <<'EOF'
+#!/bin/sh
+set -eu
+
+CONTAINER="${1:-telemt-proxy}"
+TABLE="telemt_limit"
+CHAIN="forward"
+PORT="${PORT:-443}"
+RATE="${RATE:-1/second}"
+BURST="${BURST:-1}"
+METER_TIMEOUT="${METER_TIMEOUT:-60s}"
+
+IP=""
+for i in $(seq 1 60); do
+    RUNNING="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)"
+    if [ "$RUNNING" = "true" ]; then
+        IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "$CONTAINER" | awk 'NF {print; exit}')"
+        if [ -n "$IP" ]; then
+            break
+        fi
+    fi
+    sleep 1
+done
+
+if [ -z "$IP" ]; then
+    echo "Could not get IP for container: $CONTAINER" >&2
+    exit 1
+fi
+
+nft delete table inet "$TABLE" 2>/dev/null || true
+nft add table inet "$TABLE"
+nft "add chain inet $TABLE $CHAIN { type filter hook forward priority 0; policy accept; }"
+nft "add rule inet $TABLE $CHAIN ip daddr $IP tcp dport $PORT tcp flags & (syn | ack) == syn meter telemt_in_syn_per_client { ip saddr timeout $METER_TIMEOUT limit rate over $RATE burst $BURST packets } counter drop comment \"telemt_in_syn_per_client_${RATE}_burst_${BURST}\""
+
+echo "Applied telemt inbound SYN per-client limiter:"
+echo "container=$CONTAINER ip=$IP port=$PORT rate=$RATE burst=$BURST meter_timeout=$METER_TIMEOUT"
+nft list chain inet "$TABLE" "$CHAIN"
+EOF
+
+  cat > /usr/local/sbin/telemt-in-syn-watch.sh <<'EOF'
+#!/bin/sh
+set -u
+
+CONTAINER="${1:-telemt-proxy}"
+INTERVAL="${INTERVAL:-5}"
+LAST_IP=""
+
+echo "Watching Docker container for inbound SYN limiter: $CONTAINER"
+
+while true; do
+    RUNNING="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)"
+    if [ "$RUNNING" = "true" ]; then
+        IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "$CONTAINER" 2>/dev/null | awk 'NF {print; exit}')"
+        if [ -n "$IP" ] && [ "$IP" != "$LAST_IP" ]; then
+            echo "Container IP changed: ${LAST_IP:-none} -> $IP"
+            if /usr/local/sbin/telemt-in-syn-limit.sh "$CONTAINER"; then
+                LAST_IP="$IP"
+            else
+                echo "Failed to apply nft inbound SYN rule for $CONTAINER" >&2
+            fi
+        fi
+    else
+        if [ -n "$LAST_IP" ]; then
+            echo "Container $CONTAINER is not running"
+            LAST_IP=""
+        fi
+    fi
+    sleep "$INTERVAL"
+done
+EOF
+
+  chmod +x /usr/local/sbin/telemt-in-syn-limit.sh /usr/local/sbin/telemt-in-syn-watch.sh
+
+  cat > /etc/systemd/system/telemt-in-syn-watch.service <<EOF
+[Unit]
+Description=Watch telemt Docker container and refresh nft inbound SYN per-client limiter
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/telemt-in-syn-watch.sh telemt-proxy
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl disable --now telemt-synack-watch.service >/dev/null 2>&1 || true
+  systemctl daemon-reload
+  systemctl enable --now telemt-in-syn-watch.service
+
+  if systemctl is-active telemt-in-syn-watch.service >/dev/null 2>&1; then
+    ok "Telemt nftables watcher активен"
+  else
+    warn "Telemt nftables watcher не активен. Проверь: systemctl status telemt-in-syn-watch.service --no-pager"
+  fi
 }
 
 install_3x_ui() {
@@ -518,6 +629,7 @@ configure_ssh
 [[ "$INSTALL_DOCKER" == y ]] && install_docker
 [[ "$INSTALL_DOCKER" == y && "$INSTALL_3X_UI" == y ]] && install_3x_ui
 [[ "$INSTALL_TELEMT" == y ]] && install_telemt
+[[ "$INSTALL_TELEMT" == y ]] && setup_telemt_tuning
 [[ "$ADD_ALIASES" == y ]] && add_aliases
 
 echo
@@ -525,4 +637,5 @@ echo "=== Готово ==="
 echo "Вход: ssh -p $NEW_SSH_PORT $NEW_USER@<IP_СЕРВЕРА>"
 echo "Лог: $LOG_FILE"
 echo "Если включали Telemt: порт ${TELEMT_PORT}/tcp открыт в UFW (если UFW включали), TLS domain: ${TELEMT_TLS_DOMAIN}"
+echo "Telemt nftables watcher: systemctl status telemt-in-syn-watch.service --no-pager"
 echo "Алиасы (если включали): новый вход или 'source ~/.bashrc'"
