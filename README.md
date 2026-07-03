@@ -21,13 +21,13 @@
   - `fail2ban`;
   - `Docker`;
   - панель `3x-ui` (Docker-образ из репозитория `mhsanaei/3x-ui`);
-  - MTProto proxy (через Docker);
+  - `Telemt` proxy в Docker Compose (официальный образ `ghcr.io/telemt/telemt:latest`);
   - полезные alias в `~/.bash_aliases` нового пользователя;
 - 🧾 выводит итоговое резюме с новыми параметрами доступа;
 - 📄 пишет лог установки в `/var/log/bootstrap_start2.log`.
 
-> Скрипт настроен на запуск **без дополнительных вопросов**.  
-> По умолчанию включены UFW, fail2ban, Docker, 3x-ui, MTProto и добавление alias.
+> Скрипт настроен на запуск с минимумом вопросов.  
+> По умолчанию включены UFW, fail2ban, Docker, 3x-ui, Telemt и добавление alias.
 
 ---
 
@@ -50,7 +50,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/birdset/vps-bootstrap/main/b
 Скрипт запросит:
 
 - имя нового пользователя;
-- публичный SSH-ключ (одной строкой).
+- публичный SSH-ключ (одной строкой);
+- сайт для `TELEMT_TLS_DOMAIN` (по умолчанию `petrovich.ru`).
 
 После завершения выдаст команду для входа вида:
 
@@ -69,12 +70,15 @@ ssh -p 4422 <user>@<IP_СЕРВЕРА>
   - новый SSH-порт;
   - `22/tcp` и `443/tcp` (по умолчанию);
   - дополнительные порты `2053/tcp` и `20553/tcp`;
-  - порт MTProto (по умолчанию `1243/tcp`);
+  - порт Telemt (по умолчанию `1243/tcp`);
 - ставится `fail2ban`;
 - ставится `Docker` и `docker compose` plugin;
 - поднимается контейнер панели `3x-ui` (`ghcr.io/mhsanaei/3x-ui:latest`);
-- поднимается MTProto контейнер `mtproto-proxy`;
+- создаётся конфигурация Telemt в `/opt/telemt/config/config.toml`;
+- поднимается Telemt контейнер `telemt-proxy` через `/opt/telemt/docker-compose.yml`;
 - добавляются alias в `~/.bash_aliases` нового пользователя.
+
+Telemt использует официальный Docker-образ `ghcr.io/telemt/telemt:latest`. Внешний порт сервера по умолчанию `1243`, внутри контейнера Telemt слушает `443`.
 
 ---
 
@@ -94,8 +98,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/birdset/vps-bootstrap/main/u
 - 🗑️ удаляет созданного пользователя;
 - 🔧 восстанавливает конфигурацию SSH (из бэкапа, если он есть);
 - 🧹 отключает и удаляет UFW, fail2ban и Docker;
-- 🐳 удаляет контейнеры `mtproto-proxy` и `3x-ui`;
-- 📁 удаляет директории данных `3x-ui` (`/etc/x-ui`, `/usr/local/x-ui`);
+- 🐳 удаляет контейнеры `telemt-proxy` и `3x-ui`;
+- 📁 удаляет директории данных `Telemt` (`/opt/telemt`) и `3x-ui` (`/etc/x-ui`, `/usr/local/x-ui`);
 - 📄 удаляет логи bootstrap.
 
 Если запускать не от root — скрипт **временно включает root login**, попросит установить пароль и перезапустится от root.
