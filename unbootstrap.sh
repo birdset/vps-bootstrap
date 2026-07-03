@@ -171,6 +171,18 @@ remove_fail2ban() {
   ok "Fail2ban удалён"
 }
 
+remove_telemt_tuning() {
+  ok "Удаляем Telemt nftables tuning"
+  systemctl disable --now telemt-in-syn-watch.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/telemt-in-syn-watch.service
+  rm -f /usr/local/sbin/telemt-in-syn-limit.sh /usr/local/sbin/telemt-in-syn-watch.sh
+  if command -v nft >/dev/null 2>&1; then
+    nft delete table inet telemt_limit >/dev/null 2>&1 || true
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  ok "Telemt nftables tuning удалён"
+}
+
 remove_docker() {
   if command -v docker >/dev/null 2>&1; then
     ok "Останавливаем Docker и контейнеры"
@@ -210,6 +222,7 @@ remove_user
 restore_sshd_config
 remove_ufw
 remove_fail2ban
+remove_telemt_tuning
 remove_docker
 cleanup_logs
 final_cleanup
