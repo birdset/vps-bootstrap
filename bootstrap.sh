@@ -2,12 +2,12 @@
 set -Eeuo pipefail
 
 # bootstrap.sh — Ubuntu 24.04, старт: root по SSH
-# Авто: user+sudo, SSH hardening, (опц.) UFW, (опц.) fail2ban, (опц.) Docker, (опц.) MTProto, (опц.) aliases
+# Авто: user+sudo, SSH hardening, (опц.) UFW, (опц.) fail2ban, (опц.) Docker, (опц.) Telemt, (опц.) aliases
 #
 # КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ (по вашим логам):
 # 1) Docker: убран конфликт пакетов (НЕ ставим docker.io/containerd из Ubuntu после get.docker.com).
 #    Ставим Docker через get.docker.com + docker-compose-plugin из Docker repo.
-# 2) MTProto: при включённом UFW автоматически открываем выбранный порт MTProto.
+# 2) Telemt: при включённом UFW автоматически открываем выбранный порт Telemt.
 # 3) Aliases: гарантированно создаём ~/.bash_aliases и проверяем запись; ~/.bashrc уже умеет его подключать, но добавим маркер-блок при отсутствии.
 # 4) Логирование: каждое действие пишет OK/WARN, чтобы было видно, где остановка.
 
@@ -72,6 +72,7 @@ ask_yesno() {
 is_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( 1 <= $1 && $1 <= 65535 )); }
 valid_user() { [[ "$1" =~ ^[a-z_][a-z0-9_-]*$ ]] && [[ "$1" != "root" ]]; }
 valid_key()  { [[ "$1" =~ ^ssh-(ed25519|rsa)[[:space:]][A-Za-z0-9+/=]+([[:space:]].*)?$ ]]; }
+valid_tls_domain() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ ]] && [[ "$1" == *.* ]]; }
 
 backup_file_if_exists() {
   local f="$1"
@@ -125,7 +126,7 @@ install_basics() {
   ok "Шаг: install_basics"
   apt_update_once
   apt-get upgrade -y
-  apt_install curl mc git nano openssl bash ca-certificates gnupg
+  apt_install curl mc git nano openssl bash ca-certificates gnupg jq
   ok "Базовые пакеты установлены/обновлены"
 }
 
@@ -209,10 +210,10 @@ setup_ufw() {
   ufw allow 2053/tcp
   ufw allow 20553/tcp
 
-  # Если MTProto включён — откроем порт сразу, чтобы сервис был доступен извне
-  if [[ "${INSTALL_MTPROTO:-n}" == y ]]; then
-    ufw allow "${MTPROTO_PORT}/tcp"
-    ok "UFW: открыт порт MTProto ${MTPROTO_PORT}/tcp"
+  # Если Telemt включён — откроем порт сразу, чтобы сервис был доступен извне
+  if [[ "${INSTALL_TELEMT:-n}" == y ]]; then
+    ufw allow "${TELEMT_PORT}/tcp"
+    ok "UFW: открыт порт Telemt ${TELEMT_PORT}/tcp"
   fi
 
   ufw --force enable
@@ -274,37 +275,124 @@ install_docker() {
   fi
 }
 
-install_mtproto() {
-  ok "Шаг: install_mtproto"
-  command -v docker >/dev/null 2>&1 || die "MTProto требует Docker (docker не найден)."
+install_telemt() {
+  ok "Шаг: install_telemt"
+  command -v docker >/dev/null 2>&1 || die "Telemt требует Docker (docker не найден)."
+  docker compose version >/dev/null 2>&1 || die "Telemt требует docker compose plugin (docker compose не найден)."
 
   # проверка порта на занятость на хосте
-  if ss -lnt | awk '{print $4}' | grep -qE ":${MTPROTO_PORT}\$"; then
-    die "Порт $MTPROTO_PORT занят на хосте. Выберите другой."
+  if ss -lnt | awk '{print $4}' | grep -qE ":${TELEMT_PORT}\$"; then
+    die "Порт $TELEMT_PORT занят на хосте. Выберите другой."
   fi
 
-  # idempotent: если контейнер уже есть — не создаём второй
-  if docker ps -a --format '{{.Names}}' | grep -qx 'mtproto-proxy'; then
-    warn "Контейнер mtproto-proxy уже существует. Пропускаю создание."
-    docker start mtproto-proxy || true
+  local telemt_dir="/opt/telemt"
+  local config_dir="$telemt_dir/config"
+  local config_file="$config_dir/config.toml"
+  local compose_file="$telemt_dir/docker-compose.yml"
+  local telemt_secret=""
+
+  mkdir -p "$config_dir"
+
+  if [[ -f "$config_file" ]]; then
+    backup_file_if_exists "$config_file" && ok "Сделан бэкап $config_file"
+    telemt_secret="$(awk -F'\"' '/^[[:space:]]*hello[[:space:]]*=/{print $2; exit}' "$config_file" 2>/dev/null || true)"
+  fi
+
+  if [[ ! "$telemt_secret" =~ ^[0-9a-fA-F]{32}$ ]]; then
+    telemt_secret="$(openssl rand -hex 16)"
+  fi
+
+  cat > "$config_file" <<EOF
+[general]
+use_middle_proxy = true
+log_level = "normal"
+
+[general.modes]
+classic = false
+secure = false
+tls = true
+
+[general.links]
+show = "*"
+
+[server]
+port = 443
+metrics_listen = "0.0.0.0:9090"
+
+[server.api]
+enabled = true
+listen = "0.0.0.0:9091"
+whitelist = ["127.0.0.1/32", "172.16.0.0/12"]
+
+[[server.listeners]]
+ip = "0.0.0.0"
+
+[censorship]
+tls_domain = "${TELEMT_TLS_DOMAIN}"
+mask = true
+tls_emulation = true
+tls_front_dir = "tlsfront"
+
+[access.users]
+hello = "${telemt_secret}"
+EOF
+
+  cat > "$compose_file" <<EOF
+services:
+  telemt:
+    image: ghcr.io/telemt/telemt:latest
+    container_name: telemt-proxy
+    restart: unless-stopped
+    ports:
+      - "${TELEMT_PORT}:443"
+      - "127.0.0.1:9090:9090"
+      - "127.0.0.1:9091:9091"
+    working_dir: /run/telemt
+    command: ["/etc/telemt/config.toml"]
+    volumes:
+      - ./config:/etc/telemt:rw
+    tmpfs:
+      - /run/telemt:rw,mode=1777,size=4m
+    environment:
+      - RUST_LOG=info
+    healthcheck:
+      test: ["CMD", "/app/telemt", "healthcheck", "/etc/telemt/config.toml", "--mode", "liveness"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 262144
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+EOF
+
+  docker compose -f "$compose_file" pull
+  docker compose -f "$compose_file" up -d
+
+  if docker ps --format '{{.Names}}' | grep -qx 'telemt-proxy'; then
+    ok "Telemt контейнер запущен (порт ${TELEMT_PORT} -> 443, TLS domain: ${TELEMT_TLS_DOMAIN})"
   else
-    docker pull telegrammessenger/proxy:latest
-    docker run -d \
-      --name mtproto-proxy \
-      --restart=always \
-      -p "${MTPROTO_PORT}:443" \
-      -v proxy-config:/data \
-      telegrammessenger/proxy:latest
+    warn "Контейнер telemt-proxy не запущен. Проверь: docker logs telemt-proxy"
   fi
 
-  if docker ps --format '{{.Names}}' | grep -qx 'mtproto-proxy'; then
-    ok "MTProto контейнер запущен (порт ${MTPROTO_PORT} -> 443)"
-  else
-    warn "Контейнер mtproto-proxy не запущен. Проверь: docker logs mtproto-proxy"
-  fi
+  echo "Логи Telemt:"
+  docker logs --tail 50 telemt-proxy || true
 
-  echo "Логи MTProto (secret/link):"
-  docker logs mtproto-proxy || true
+  echo "Ссылка Telemt для подключения:"
+  curl -fsS http://127.0.0.1:9091/v1/users 2>/dev/null | jq -r '.data[] | "[\(.username)]", (.links.tls[]? | "tls: \(.)"), ""' || warn "Не удалось получить ссылку через API. Проверь позже: curl -s http://127.0.0.1:9091/v1/users"
 }
 
 install_3x_ui() {
@@ -397,8 +485,13 @@ valid_key "$PUBLIC_KEY" || die "Некорректный SSH-ключ."
 
 NEW_SSH_PORT="4422"
 ALLOW_IP=""
-INSTALL_MTPROTO="y"
-MTPROTO_PORT="1243"
+INSTALL_TELEMT="y"
+TELEMT_PORT="1243"
+while true; do
+  TELEMT_TLS_DOMAIN="$(ask_default "Какой сайт использовать для TELEMT_TLS_DOMAIN" "petrovich.ru")"
+  valid_tls_domain "$TELEMT_TLS_DOMAIN" && break
+  echo "Некорректный домен. Пример: petrovich.ru"
+done
 ENABLE_UFW="y"
 OPEN_443="y"
 OPEN_22="y"
@@ -410,7 +503,7 @@ ADD_ALIASES="y"
 
 echo
 echo "=== План ==="
-echo "User: $NEW_USER | SSH port: $NEW_SSH_PORT | UFW: $ENABLE_UFW | Fail2ban: $INSTALL_F2B | Docker: $INSTALL_DOCKER | 3x-ui: $INSTALL_3X_UI | MTProto: $INSTALL_MTPROTO | MTProto port: $MTPROTO_PORT | Aliases: $ADD_ALIASES"
+echo "User: $NEW_USER | SSH port: $NEW_SSH_PORT | UFW: $ENABLE_UFW | Fail2ban: $INSTALL_F2B | Docker: $INSTALL_DOCKER | 3x-ui: $INSTALL_3X_UI | Telemt: $INSTALL_TELEMT | Telemt port: $TELEMT_PORT | Telemt TLS domain: $TELEMT_TLS_DOMAIN | Aliases: $ADD_ALIASES"
 echo
 
 ok "Стартуем без дополнительных вопросов."
@@ -424,12 +517,12 @@ configure_ssh
 [[ "$INSTALL_F2B" == y ]] && setup_fail2ban
 [[ "$INSTALL_DOCKER" == y ]] && install_docker
 [[ "$INSTALL_DOCKER" == y && "$INSTALL_3X_UI" == y ]] && install_3x_ui
-[[ "$INSTALL_MTPROTO" == y ]] && install_mtproto
+[[ "$INSTALL_TELEMT" == y ]] && install_telemt
 [[ "$ADD_ALIASES" == y ]] && add_aliases
 
 echo
 echo "=== Готово ==="
 echo "Вход: ssh -p $NEW_SSH_PORT $NEW_USER@<IP_СЕРВЕРА>"
 echo "Лог: $LOG_FILE"
-echo "Если включали MTProto: порт ${MTPROTO_PORT}/tcp открыт в UFW (если UFW включали)"
+echo "Если включали Telemt: порт ${TELEMT_PORT}/tcp открыт в UFW (если UFW включали), TLS domain: ${TELEMT_TLS_DOMAIN}"
 echo "Алиасы (если включали): новый вход или 'source ~/.bashrc'"
