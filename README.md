@@ -22,6 +22,7 @@
   - `Docker`;
   - панель `3x-ui` (Docker-образ из репозитория `mhsanaei/3x-ui`);
   - `Telemt` proxy в Docker Compose (официальный образ `ghcr.io/telemt/telemt:latest`);
+  - автоматический `nftables` limiter для входящих SYN к контейнеру Telemt;
   - полезные alias в `~/.bash_aliases` нового пользователя;
 - 🧾 выводит итоговое резюме с новыми параметрами доступа;
 - 📄 пишет лог установки в `/var/log/bootstrap_start2.log`.
@@ -72,13 +73,49 @@ ssh -p 4422 <user>@<IP_СЕРВЕРА>
   - дополнительные порты `2053/tcp` и `20553/tcp`;
   - порт Telemt (по умолчанию `1243/tcp`);
 - ставится `fail2ban`;
-- ставится `Docker` и `docker compose` plugin;
+- ставится `Docker`, `docker compose` plugin и `nftables`;
 - поднимается контейнер панели `3x-ui` (`ghcr.io/mhsanaei/3x-ui:latest`);
 - создаётся конфигурация Telemt в `/opt/telemt/config/config.toml`;
 - поднимается Telemt контейнер `telemt-proxy` через `/opt/telemt/docker-compose.yml`;
+- создаются скрипты настройки лимитера:
+  - `/usr/local/sbin/telemt-in-syn-limit.sh`;
+  - `/usr/local/sbin/telemt-in-syn-watch.sh`;
+- включается systemd service `telemt-in-syn-watch.service`;
 - добавляются alias в `~/.bash_aliases` нового пользователя.
 
 Telemt использует официальный Docker-образ `ghcr.io/telemt/telemt:latest`. Внешний порт сервера по умолчанию `1243`, внутри контейнера Telemt слушает `443`.
+
+---
+
+## ⚙️ Автоматические настройки Telemt
+
+В конфиг Telemt добавляются базовые настройки из инструкции `telemt-tune`:
+
+```toml
+[general]
+tg_connect = 10
+
+[timeouts]
+client_handshake = 15
+client_keepalive = 60
+```
+
+Для Docker-контейнера `telemt-proxy` также настраивается inbound SYN limiter через `nftables`:
+
+- таблица: `inet telemt_limit`;
+- chain: `forward`;
+- контейнерный IP берётся автоматически через `docker inspect`;
+- правило применяется к `tcp dport 443` внутри контейнера;
+- лимит: `1/second`, `burst 1`, `timeout 60s`;
+- watcher service обновляет правило, если Docker выдаст контейнеру новый IP.
+
+Проверка после установки:
+
+```bash
+systemctl status telemt-in-syn-watch.service --no-pager
+nft list chain inet telemt_limit forward
+docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' telemt-proxy
+```
 
 ---
 
@@ -98,6 +135,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/birdset/vps-bootstrap/main/u
 - 🗑️ удаляет созданного пользователя;
 - 🔧 восстанавливает конфигурацию SSH (из бэкапа, если он есть);
 - 🧹 отключает и удаляет UFW, fail2ban и Docker;
+- 🧯 отключает `telemt-in-syn-watch.service`, удаляет scripts и таблицу `inet telemt_limit`;
 - 🐳 удаляет контейнеры `telemt-proxy` и `3x-ui`;
 - 📁 удаляет директории данных `Telemt` (`/opt/telemt`) и `3x-ui` (`/etc/x-ui`, `/usr/local/x-ui`);
 - 📄 удаляет логи bootstrap.
