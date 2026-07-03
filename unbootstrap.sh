@@ -174,11 +174,15 @@ remove_fail2ban() {
 remove_docker() {
   if command -v docker >/dev/null 2>&1; then
     ok "Останавливаем Docker и контейнеры"
-    docker rm -f mtproto-proxy >/dev/null 2>&1 || true
+    if [[ -f /opt/telemt/docker-compose.yml ]] && docker compose version >/dev/null 2>&1; then
+      docker compose -f /opt/telemt/docker-compose.yml down >/dev/null 2>&1 || true
+    fi
+    docker rm -f telemt-proxy >/dev/null 2>&1 || true
     docker rm -f 3x-ui >/dev/null 2>&1 || true
-    docker volume rm proxy-config >/dev/null 2>&1 || true
-    rm -rf /etc/x-ui /usr/local/x-ui || true
+    rm -rf /opt/telemt /etc/x-ui /usr/local/x-ui || true
     systemctl disable --now docker || true
+  else
+    rm -rf /opt/telemt /etc/x-ui /usr/local/x-ui || true
   fi
 
   apt_purge_if_installed docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras
