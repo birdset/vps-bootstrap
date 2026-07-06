@@ -94,6 +94,7 @@ Telemt использует официальный Docker-образ `ghcr.io/te
 ```toml
 [general]
 tg_connect = 10
+client_mss_bulk = "1400"
 
 [timeouts]
 client_handshake = 15
