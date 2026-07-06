@@ -307,6 +307,7 @@ install_telemt() {
 use_middle_proxy = true
 log_level = "normal"
 tg_connect = 10
+client_mss_bulk = "1400"
 
 [timeouts]
 client_handshake = 15
