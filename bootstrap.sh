@@ -1,237 +1,260 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+umask 077
 
-# bootstrap.sh — Ubuntu 24.04, старт: root по SSH
-# Авто: user+sudo, SSH hardening, (опц.) UFW, (опц.) fail2ban, (опц.) Docker, (опц.) Telemt, (опц.) aliases
-#
-# КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ (по вашим логам):
-# 1) Docker: убран конфликт пакетов (НЕ ставим docker.io/containerd из Ubuntu после get.docker.com).
-#    Ставим Docker через get.docker.com + docker-compose-plugin из Docker repo.
-# 2) Telemt: при включённом UFW автоматически открываем выбранный порт Telemt.
-# 3) Aliases: гарантированно создаём ~/.bash_aliases и проверяем запись; ~/.bashrc уже умеет его подключать, но добавим маркер-блок при отсутствии.
-# 4) Логирование: каждое действие пишет OK/WARN, чтобы было видно, где остановка.
+# Ubuntu 24.04. Run prepare as root, verify a new SSH session, then run --finalize.
+STATE_DIR=/var/lib/vps-bootstrap
+STATE_FILE=$STATE_DIR/settings.tsv
+MANIFEST=$STATE_DIR/created.tsv
+LOG_FILE=/var/log/vps-bootstrap.log
+SSH_DROPIN=/etc/ssh/sshd_config.d/00-vps-bootstrap.conf
 
-LOG_FILE="/var/log/bootstrap_start2.log"
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+ok() { printf 'OK: %s\n' "$*"; }
+warn() { printf 'WARN: %s\n' "$*" >&2; }
+usage() {
+  cat <<'EOF'
+Usage: bash bootstrap.sh [--prepare | --finalize --confirm-ssh-login]
+--prepare: create the user, install services, and listen on both old and new SSH ports.
+--finalize: after logging in through a second SSH session on the new port,
+            disable root and password SSH login.
+EOF
+}
+
+MODE=prepare
+CONFIRM_LOGIN=false
+while (($#)); do
+  case "$1" in
+    --prepare) MODE=prepare ;;
+    --finalize) MODE=finalize ;;
+    --confirm-ssh-login) CONFIRM_LOGIN=true ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown argument: $1" ;;
+  esac
+  shift
+done
+[[ $(id -u) -eq 0 ]] || die "Run as root: sudo bash bootstrap.sh"
+. /etc/os-release
+[[ ${ID:-} == ubuntu && ${VERSION_ID:-} == 24.04 ]] || die "Only Ubuntu 24.04 is supported."
+install -d -m 700 "$STATE_DIR"
+touch "$MANIFEST" "$STATE_FILE"
+chmod 600 "$MANIFEST" "$STATE_FILE"
+touch "$LOG_FILE"
+chmod 600 "$LOG_FILE"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-die() { echo "ОШИБКА: $*" >&2; exit 1; }
-ok()  { echo "OK: $*"; }
-warn(){ echo "WARN: $*"; }
-
-[[ "$(id -u)" -eq 0 ]] || die "Запустите скрипт от root."
-
-# ---------------- helpers ----------------
-APT_UPDATED=0
-
-apt_update_once() {
-  if (( APT_UPDATED == 0 )); then
-    apt-get update
-    APT_UPDATED=1
-  fi
+has_record() { grep -qxF "$(printf '%s\t%s' "$1" "$2")" "$MANIFEST"; }
+record() {
+  has_record "$1" "$2" || printf '%s\t%s\n' "$1" "$2" >> "$MANIFEST"
 }
-
+get_setting() { awk -F '\t' -v key="$1" '$1 == key {print $2; exit}' "$STATE_FILE"; }
+set_setting() {
+  [[ -z $(get_setting "$1") ]] || die "Setting already recorded: $1"
+  printf '%s\t%s\n' "$1" "$2" >> "$STATE_FILE"
+}
+ask() {
+  local answer
+  read -r -p "$1: " answer || die "Input ended."
+  printf '%s' "$answer"
+}
+valid_user() { [[ "$1" =~ ^[a-z_][a-z0-9_-]*$ && "$1" != root ]]; }
+valid_domain() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ && "$1" == *.* ]]; }
+valid_key() { printf '%s\n' "$1" | ssh-keygen -lf /dev/stdin >/dev/null 2>&1; }
 apt_install() {
-  apt_update_once
-  apt-get install -y "$@"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
 }
-
-trim() {
-  local s="$1"
-  s="${s#"${s%%[![:space:]]*}"}"
-  s="${s%"${s##*[![:space:]]}"}"
-  echo "$s"
-}
-
-ask_default() {
-  local p="$1" d="$2" v
-  read -r -p "$p [$d]: " v || true
-  v="$(trim "$v")"
-  echo "${v:-$d}"
-}
-
-ask_optional() {
-  local p="$1" v
-  read -r -p "$p (Enter — пропустить): " v || true
-  v="$(trim "$v")"
-  echo "$v"
-}
-
-ask_yesno() {
-  local p="$1" d="$2" a
-  while true; do
-    read -r -p "$p (y/n) [$d]: " a || true
-    a="$(trim "${a:-$d}")"
-    case "$a" in
-      y|Y) echo y; return 0 ;;
-      n|N) echo n; return 0 ;;
-      *) echo "Введите y или n." ;;
-    esac
-  done
-}
-
-is_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( 1 <= $1 && $1 <= 65535 )); }
-valid_user() { [[ "$1" =~ ^[a-z_][a-z0-9_-]*$ ]] && [[ "$1" != "root" ]]; }
-valid_key()  { [[ "$1" =~ ^ssh-(ed25519|rsa)[[:space:]][A-Za-z0-9+/=]+([[:space:]].*)?$ ]]; }
-valid_tls_domain() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ ]] && [[ "$1" == *.* ]]; }
-
-backup_file_if_exists() {
-  local f="$1"
-  if [[ -f "$f" ]]; then
-    cp -a "$f" "${f}.bak.$(date +%F_%H%M%S)"
-    return 0
+guard_new_file() {
+  local path=$1
+  if [[ -e $path || -L $path ]] && ! has_record file "$path"; then
+    die "Existing file is not owned by vps-bootstrap: $path"
   fi
-  return 1
 }
-
-backup_file_must() {
-  local f="$1"
-  [[ -f "$f" ]] || die "Файл не найден: $f"
-  local b="${f}.bak.$(date +%F_%H%M%S)"
-  cp -a "$f" "$b"
-  echo "$b"
+guard_new_dir() {
+  local path=$1
+  if [[ -e $path || -L $path ]] && ! has_record dir "$path"; then
+    die "Existing directory is not owned by vps-bootstrap: $path"
+  fi
 }
-
-ensure_kv() {
-  local f="$1" k="$2" v="$3"
-  if grep -qE "^[#[:space:]]*$k[[:space:]]+" "$f"; then
-    sed -i -E "s|^[#[:space:]]*$k[[:space:]]+.*|$k $v|" "$f"
+managed_file() {
+  local path=$1 mode=$2 content=$3 temp
+  guard_new_file "$path"
+  temp=$(mktemp "$STATE_DIR/write.XXXXXX")
+  printf '%s' "$content" > "$temp"
+  if [[ -e $path ]]; then
+    if ! cmp -s "$temp" "$path"; then
+      rm -f "$temp"
+      die "Managed file changed; inspect it before rerunning: $path"
+    fi
+    rm -f "$temp"
+    return
+  fi
+  install -m "$mode" "$temp" "$path"
+  rm -f "$temp"
+  record file "$path"
+}
+ufw_allow_if_missing() {
+  local port=$1
+  if ! ufw show added | grep -qF "ufw allow $port/tcp"; then
+    ufw allow "$port/tcp"
+    record ufw "$port/tcp"
+  fi
+}
+reload_ssh() {
+  systemctl daemon-reload
+  if systemctl is-active --quiet ssh.socket; then
+    systemctl restart ssh.socket
+    if systemctl is-active --quiet ssh.service; then
+      systemctl reload ssh.service
+    fi
   else
-    echo "$k $v" >> "$f"
+    systemctl reload ssh.service
   fi
 }
-
-port_listening() {
-  local p="$1"
-  ss -lntp 2>/dev/null | grep -qE ":${p}\b"
+image_digest() {
+  local key=$1 tag=$2 saved
+  saved=$(get_setting "$key")
+  if [[ -n $saved ]]; then printf '%s' "$saved"; return; fi
+  docker pull "$tag" >&2
+  local digest
+  digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$tag")
+  [[ $digest == *@sha256:* ]] || die "Could not resolve image digest: $tag"
+  set_setting "$key" "$digest"
+  printf '%s' "$digest"
 }
 
-ensure_run_sshd_dir() {
-  mkdir -p /run/sshd
-  chown root:root /run/sshd
-  chmod 0755 /run/sshd
-}
-
-append_block_once() {
-  local file="$1" marker="$2" block="$3"
-  touch "$file"
-  if ! grep -qF "$marker" "$file"; then
-    printf "\n%s\n%s\n" "$marker" "$block" >> "$file"
-    return 0
+if [[ $MODE == prepare ]]; then
+  if [[ -z $(get_setting user) ]]; then
+    NEW_USER=$(ask "New user name")
+    valid_user "$NEW_USER" || die "Invalid user name."
+    id "$NEW_USER" &>/dev/null && die "User already exists: $NEW_USER"
+    PUBLIC_KEY=$(ask "Public SSH key (one line)")
+    valid_key "$PUBLIC_KEY" || die "Invalid public SSH key."
+    TELEMT_TLS_DOMAIN=$(ask "Telemt TLS domain")
+    valid_domain "$TELEMT_TLS_DOMAIN" || die "Invalid domain."
+    set_setting user "$NEW_USER"
+    set_setting ssh_port 4422
+    set_setting telemt_port 1243
+    set_setting tls_domain "$TELEMT_TLS_DOMAIN"
+  else
+    NEW_USER=$(get_setting user)
+    PUBLIC_KEY=$(ask "Public SSH key (one line)")
+    valid_key "$PUBLIC_KEY" || die "Invalid public SSH key."
+    TELEMT_TLS_DOMAIN=$(get_setting tls_domain)
   fi
-  return 1
-}
+else
+  [[ $CONFIRM_LOGIN == true ]] || die "First verify a second SSH login, then pass --confirm-ssh-login."
+  [[ -n $(get_setting user) ]] || die "Run --prepare first."
+fi
+NEW_USER=$(get_setting user)
+NEW_SSH_PORT=$(get_setting ssh_port)
+TELEMT_PORT=$(get_setting telemt_port)
+TELEMT_TLS_DOMAIN=$(get_setting tls_domain)
 
 # ---------------- actions ----------------
 install_basics() {
-  ok "Шаг: install_basics"
-  apt_update_once
-  apt-get upgrade -y
-  apt_install curl mc git nano openssl bash ca-certificates gnupg jq nftables
-  ok "Базовые пакеты установлены/обновлены"
+  apt_install curl git nano openssl ca-certificates gnupg jq ufw
+  ok "Basic packages installed; system packages were not upgraded."
 }
-
 create_user() {
-  ok "Шаг: create_user"
-  if ! id "$NEW_USER" &>/dev/null; then
-    useradd -m -s /bin/bash "$NEW_USER"
-    passwd "$NEW_USER"
-    ok "Пользователь создан: $NEW_USER"
-  else
-    ok "Пользователь уже существует: $NEW_USER"
+  if has_record user "$NEW_USER"; then
+    id "$NEW_USER" &>/dev/null || die "Managed user is missing: $NEW_USER"
+    return
   fi
-
+  id "$NEW_USER" &>/dev/null && die "Refusing to modify pre-existing user: $NEW_USER"
+  useradd -m -s /bin/bash "$NEW_USER"
+  record user "$NEW_USER"
   usermod -aG sudo "$NEW_USER"
-  ok "Пользователь добавлен в sudo: $NEW_USER"
+  passwd "$NEW_USER"
+  ok "Created sudo user: $NEW_USER"
 }
-
 setup_keys() {
-  ok "Шаг: setup_keys"
-  [[ -n "$PUBLIC_KEY" ]] || die "SSH-ключ обязателен."
-  valid_key "$PUBLIC_KEY" || die "Некорректный SSH-ключ (ssh-ed25519/ssh-rsa одной строкой)."
-
-  local home
-  home="$(getent passwd "$NEW_USER" | cut -d: -f6)"
-  [[ -n "$home" && -d "$home" ]] || die "Не найден home для пользователя $NEW_USER"
-
-  install -d -m 700 -o "$NEW_USER" -g "$NEW_USER" "$home/.ssh"
-  local ak="$home/.ssh/authorized_keys"
-  touch "$ak"
-  chown "$NEW_USER:$NEW_USER" "$ak"
-  chmod 600 "$ak"
-
-  grep -qxF "$PUBLIC_KEY" "$ak" || echo "$PUBLIC_KEY" >> "$ak"
-  ok "SSH-ключ добавлен в $ak"
+  local home ak
+  home=$(getent passwd "$NEW_USER" | cut -d: -f6)
+  [[ -d $home ]] || die "Home directory missing for $NEW_USER"
+  ak=$home/.ssh/authorized_keys
+  if [[ -n $PUBLIC_KEY ]]; then
+    install -d -m 700 -o "$NEW_USER" -g "$NEW_USER" "$home/.ssh"
+    touch "$ak"
+    chown "$NEW_USER:$NEW_USER" "$ak"
+    chmod 600 "$ak"
+    grep -qxF "$PUBLIC_KEY" "$ak" || printf '%s\n' "$PUBLIC_KEY" >> "$ak"
+  fi
+  [[ -s $ak ]] || die "authorized_keys is missing or empty: $ak"
+  ok "SSH key present for $NEW_USER"
+}
+prepare_ssh() {
+  guard_new_file "$SSH_DROPIN"
+  local ports content='' port
+  ports=$(get_setting old_ssh_ports)
+  for port in $ports; do content+="Port $port"$'\n'; done
+  case " $ports " in *" $NEW_SSH_PORT "*) ;; *) content+="Port $NEW_SSH_PORT"$'\n' ;; esac
+  content+="# Managed by vps-bootstrap; finalize only after a real SSH login."$'\n'
+  managed_file "$SSH_DROPIN" 600 "$content"
+  if ! sshd -t || ! sshd -T | awk '$1=="port" {print $2}' | grep -qx "$NEW_SSH_PORT"; then
+    die "New SSH configuration is invalid. Keep the current session and inspect $SSH_DROPIN"
+  fi
+  reload_ssh
+  ss -lnt | awk '{print $4}' | grep -qE ":$NEW_SSH_PORT$" ||
+    die "New SSH port is not listening. Keep the current session."
+  ok "SSH listens on old port(s) and $NEW_SSH_PORT; root login remains unchanged."
 }
 
-configure_ssh() {
-  ok "Шаг: configure_ssh"
-  local f="/etc/ssh/sshd_config"
-  local backup
-  backup="$(backup_file_must "$f")"
-  ok "Бэкап sshd_config: $backup"
-
-  ensure_kv "$f" PermitRootLogin no
-  ensure_kv "$f" PasswordAuthentication no
-  ensure_kv "$f" PubkeyAuthentication yes
-  ensure_kv "$f" AuthorizedKeysFile ".ssh/authorized_keys"
-  ensure_kv "$f" Port "$NEW_SSH_PORT"
-
-  ensure_run_sshd_dir
-
+enable_ufw_if_needed() {
+  if ! ufw status | grep -q '^Status: active'; then
+    ufw --force enable
+    record ufw_enabled yes
+  fi
+}
+finalize_ssh() {
+  [[ -f $SSH_DROPIN ]] && has_record file "$SSH_DROPIN" ||
+    die "Managed SSH drop-in is missing."
+  local backup effective
+  backup=$(mktemp "$STATE_DIR/ssh-prepare.XXXXXX")
+  cp -a "$SSH_DROPIN" "$backup"
+  printf 'Port %s\nPermitRootLogin no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\n' "$NEW_SSH_PORT" > "$SSH_DROPIN"
+  chmod 600 "$SSH_DROPIN"
   if ! sshd -t; then
-    cp -a "$backup" "$f"
-    die "sshd -t не прошёл. Откат на бэкап выполнен."
+    cp -a "$backup" "$SSH_DROPIN"
+    die "sshd -t failed; prepare configuration restored."
   fi
-
-  if ! systemctl restart ssh; then
-    cp -a "$backup" "$f"
-    systemctl restart ssh || true
-    die "Не удалось перезапустить SSH. Откат на бэкап выполнен."
+  effective=$(sshd -T -C user=root,host=localhost,addr=127.0.0.1)
+  if ! grep -qx "permitrootlogin no" <<< "$effective" ||
+     ! grep -qx "passwordauthentication no" <<< "$effective" ||
+     ! grep -qx "kbdinteractiveauthentication no" <<< "$effective" ||
+     ! grep -qx "port $NEW_SSH_PORT" <<< "$effective" ||
+     [[ $(awk '$1=="port" {n++} END {print n+0}' <<< "$effective") -ne 1 ]]; then
+    cp -a "$backup" "$SSH_DROPIN"
+    die "Effective SSH settings differ from expected; prepare configuration restored."
   fi
-
-  if port_listening "$NEW_SSH_PORT"; then
-    ok "sshd слушает порт $NEW_SSH_PORT"
-  else
-    warn "Не вижу, что sshd слушает порт $NEW_SSH_PORT. Проверь: ss -lntp | grep sshd"
+  if ! reload_ssh; then
+    cp -a "$backup" "$SSH_DROPIN"
+    reload_ssh || true
+    die "SSH reload failed; prepare configuration restored."
   fi
-
-  ok "SSH настроен"
+  if ! ss -lnt | awk '{print $4}' | grep -qE ":$NEW_SSH_PORT$"; then
+    cp -a "$backup" "$SSH_DROPIN"
+    reload_ssh || true
+    die "New SSH port is not listening; prepare configuration restored."
+  fi
+  record finalized yes
 }
-
 setup_ufw() {
-  ok "Шаг: setup_ufw"
-  apt_install ufw
-  ufw default deny incoming
-  ufw default allow outgoing
-
-  ufw allow "$NEW_SSH_PORT/tcp"
-  [[ "$OPEN_443" == y ]] && ufw allow 443/tcp
-  [[ "$OPEN_22"  == y ]] && ufw allow 22/tcp
-  ufw allow 2053/tcp
-  ufw allow 20553/tcp
-
-  # Если Telemt включён — откроем порт сразу, чтобы сервис был доступен извне
-  if [[ "${INSTALL_TELEMT:-n}" == y ]]; then
-    ufw allow "${TELEMT_PORT}/tcp"
-    ok "UFW: открыт порт Telemt ${TELEMT_PORT}/tcp"
+  local old_ports port
+  old_ports=$(get_setting old_ssh_ports)
+  if [[ -z $old_ports ]]; then
+    old_ports=$(sshd -T | awk '$1=="port" {print $2}' | sort -u | xargs)
+    [[ -n $old_ports ]] || die "Could not determine current SSH port."
+    set_setting old_ssh_ports "$old_ports"
   fi
-
-  ufw --force enable
-  ufw status verbose
-  ok "UFW включён и настроен"
+  ufw_allow_if_missing "$NEW_SSH_PORT"
+  ufw_allow_if_missing "$TELEMT_PORT"
+  ok "UFW rules for new SSH and Telemt ports are prepared."
 }
-
 setup_fail2ban() {
-  ok "Шаг: setup_fail2ban"
   apt_install fail2ban
-  systemctl enable --now fail2ban
-
-  local f="/etc/fail2ban/jail.d/sshd.local"
-  cat > "$f" <<EOF
+  local f=/etc/fail2ban/jail.d/vps-bootstrap-sshd.local content
+  content=$(cat <<EOF
 [DEFAULT]
-bantime = 1d
-findtime = 10m
-maxretry = 5
 banaction = ufw
 
 [sshd]
@@ -239,46 +262,64 @@ enabled = true
 maxretry = 3
 findtime = 1d
 bantime = 1w
-port = ssh
+port = $NEW_SSH_PORT
 EOF
-
-  [[ -n "$ALLOW_IP" ]] && echo "ignoreip = $ALLOW_IP" >> "$f"
-
-  systemctl restart fail2ban || true
-  if fail2ban-client ping >/dev/null 2>&1; then
-    ok "Fail2ban активен"
-  else
-    warn "Fail2ban установлен, но ping не прошёл (проверь: systemctl status fail2ban)"
+)
+  managed_file "$f" 600 "$content"
+  if ! systemctl is-enabled --quiet fail2ban; then
+    systemctl enable fail2ban
+    record service fail2ban
   fi
+  systemctl restart fail2ban
+  fail2ban-client ping >/dev/null || die "Fail2ban did not start."
 }
-
 install_docker() {
-  ok "Шаг: install_docker"
-
-  # Установка Docker (официальный способ через get.docker.com)
-  # ВАЖНО: НЕ ставим потом docker.io/containerd из Ubuntu — это и вызвало конфликт containerd.io vs containerd.
-  curl -fsSL https://get.docker.com | sh
-
+  if command -v docker >/dev/null 2>&1; then
+    docker compose version >/dev/null 2>&1 ||
+      die "Existing Docker has no Compose plugin. Install it before rerunning."
+    ok "Using existing Docker installation."
+    return
+  fi
+  local conflict
+  for conflict in docker.io docker-compose docker-compose-v2 podman-docker containerd runc; do
+    if dpkg-query -W -f='${Status}' "$conflict" 2>/dev/null | grep -qx 'install ok installed'; then
+      die "Conflicting pre-existing package $conflict; resolve manually before Docker installation."
+    fi
+  done
+  install -d -m 755 /etc/apt/keyrings
+  local key
+  key=$(curl -fsSL https://download.docker.com/linux/ubuntu/gpg)
+  managed_file /etc/apt/keyrings/docker.asc 644 "$key"
+  local source
+  source=$(cat <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: ${UBUNTU_CODENAME:-$VERSION_CODENAME}
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+)
+  managed_file /etc/apt/sources.list.d/docker.sources 644 "$source"
+  apt-get update
+  apt_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   systemctl enable --now docker
-  if systemctl is-active docker >/dev/null 2>&1; then
-    ok "Docker daemon активен"
-  else
-    die "Docker установлен, но daemon не активен (systemctl status docker)"
-  fi
-
-  # docker compose plugin (из Docker repo, не docker-compose пакет Ubuntu)
-  apt_install docker-compose-plugin
-
-  if [[ "$ADD_DOCKER_GROUP" == y ]]; then
-    usermod -aG docker "$NEW_USER" || warn "Не удалось добавить $NEW_USER в группу docker"
-    ok "Пользователь добавлен в группу docker (нужен новый вход в сессию)"
-  fi
+  docker compose version >/dev/null || die "Docker Compose plugin is not working."
+  record docker_installed yes
+  ok "Docker installed from the official apt repository."
 }
-
 install_telemt() {
   ok "Шаг: install_telemt"
   command -v docker >/dev/null 2>&1 || die "Telemt требует Docker (docker не найден)."
   docker compose version >/dev/null 2>&1 || die "Telemt требует docker compose plugin (docker compose не найден)."
+
+  if docker ps -a --format '{{.Names}}' | grep -qx telemt-proxy; then
+    has_record container telemt-proxy ||
+      die "Existing telemt-proxy container is not managed by vps-bootstrap."
+    docker start telemt-proxy >/dev/null || true
+    ok "Using managed Telemt container."
+    return
+  fi
 
   # проверка порта на занятость на хосте
   if ss -lnt | awk '{print $4}' | grep -qE ":${TELEMT_PORT}\$"; then
@@ -289,19 +330,22 @@ install_telemt() {
   local config_dir="$telemt_dir/config"
   local config_file="$config_dir/config.toml"
   local compose_file="$telemt_dir/docker-compose.yml"
-  local telemt_secret=""
+  local telemt_secret="" telemt_api_secret=""
 
-  mkdir -p "$config_dir"
-
-  if [[ -f "$config_file" ]]; then
-    backup_file_if_exists "$config_file" && ok "Сделан бэкап $config_file"
-    telemt_secret="$(awk -F'\"' '/^[[:space:]]*hello[[:space:]]*=/{print $2; exit}' "$config_file" 2>/dev/null || true)"
+  guard_new_dir "$telemt_dir"
+  guard_new_file "$config_file"
+  guard_new_file "$compose_file"
+  if [[ ! -e "$telemt_dir" ]]; then
+    install -d -m 700 "$telemt_dir"
+    record dir "$telemt_dir"
   fi
+  install -d -m 700 "$config_dir"
+  telemt_secret="$(openssl rand -hex 16)"
+  telemt_api_secret="$(openssl rand -hex 24)"
+  local TELEMT_IMAGE
+  TELEMT_IMAGE=$(image_digest telemt_image ghcr.io/telemt/telemt:latest)
 
-  if [[ ! "$telemt_secret" =~ ^[0-9a-fA-F]{32}$ ]]; then
-    telemt_secret="$(openssl rand -hex 16)"
-  fi
-
+  if [[ ! -e "$config_file" ]]; then
   cat > "$config_file" <<EOF
 [general]
 use_middle_proxy = true
@@ -323,12 +367,11 @@ show = "*"
 
 [server]
 port = 443
-metrics_listen = "0.0.0.0:9090"
-
 [server.api]
 enabled = true
 listen = "0.0.0.0:9091"
 whitelist = ["127.0.0.1/32", "172.16.0.0/12"]
+auth_header = "Bearer ${telemt_api_secret}"
 
 [[server.listeners]]
 ip = "0.0.0.0"
@@ -342,16 +385,19 @@ tls_front_dir = "tlsfront"
 [access.users]
 hello = "${telemt_secret}"
 EOF
+  chmod 600 "$config_file"
+  record file "$config_file"
+  fi
 
+  if [[ ! -e "$compose_file" ]]; then
   cat > "$compose_file" <<EOF
 services:
   telemt:
-    image: ghcr.io/telemt/telemt:latest
+    image: ${TELEMT_IMAGE}
     container_name: telemt-proxy
     restart: unless-stopped
     ports:
-      - "${TELEMT_PORT}:443"
-      - "127.0.0.1:9090:9090"
+      - "0.0.0.0:${TELEMT_PORT}:443"
       - "127.0.0.1:9091:9091"
     working_dir: /run/telemt
     command: ["/etc/telemt/config.toml"]
@@ -384,9 +430,13 @@ services:
         max-size: "50m"
         max-file: "5"
 EOF
+  chmod 600 "$compose_file"
+  record file "$compose_file"
+  fi
 
   docker compose -f "$compose_file" pull
   docker compose -f "$compose_file" up -d
+  record container telemt-proxy
 
   if docker ps --format '{{.Names}}' | grep -qx 'telemt-proxy'; then
     ok "Telemt контейнер запущен (порт ${TELEMT_PORT} -> 443, TLS domain: ${TELEMT_TLS_DOMAIN})"
@@ -394,94 +444,73 @@ EOF
     warn "Контейнер telemt-proxy не запущен. Проверь: docker logs telemt-proxy"
   fi
 
-  echo "Логи Telemt:"
-  docker logs --tail 50 telemt-proxy || true
-
-  echo "Ссылка Telemt для подключения:"
-  curl -fsS http://127.0.0.1:9091/v1/users 2>/dev/null | jq -r '.data[] | "[\(.username)]", (.links.tls[]? | "tls: \(.)"), ""' || warn "Не удалось получить ссылку через API. Проверь позже: curl -s http://127.0.0.1:9091/v1/users"
+  ok "Telemt diagnostics: docker ps --filter name=telemt-proxy"
 }
 
 setup_telemt_tuning() {
-  ok "Шаг: setup_telemt_tuning"
-  command -v nft >/dev/null 2>&1 || die "Для настройки Telemt требуется nftables (nft не найден)."
-  command -v docker >/dev/null 2>&1 || die "Для настройки Telemt требуется Docker (docker не найден)."
-
-  cat > /usr/local/sbin/telemt-in-syn-limit.sh <<'EOF'
+  command -v iptables >/dev/null 2>&1 || die "Telemt limiter requires iptables."
+  iptables -S DOCKER-USER >/dev/null 2>&1 ||
+    die "Docker's DOCKER-USER chain is unavailable; limiter was not installed."
+  docker ps --format '{{.Names}}' | grep -qx telemt-proxy ||
+    die "Telemt is not running; limiter cannot be verified."
+  local limit=/usr/local/sbin/telemt-in-syn-limit.sh
+  local watch=/usr/local/sbin/telemt-in-syn-watch.sh
+  local unit=/etc/systemd/system/telemt-in-syn-watch.service
+  if [[ -e $limit || -e $watch || -e $unit ]]; then
+    has_record file "$limit" && has_record file "$watch" && has_record file "$unit" ||
+      die "Existing Telemt limiter files are not fully managed."
+    record iptables_chain VPS-TELEMT
+    "$limit" telemt-proxy
+    systemctl is-active --quiet telemt-in-syn-watch.service ||
+      systemctl start telemt-in-syn-watch.service
+    return
+  fi
+  if iptables -S VPS-TELEMT >/dev/null 2>&1 &&
+     ! has_record iptables_chain VPS-TELEMT; then
+    die "Existing VPS-TELEMT firewall chain is not managed."
+  fi
+  cat > "$limit" <<'EOF'
 #!/bin/sh
 set -eu
-
 CONTAINER="${1:-telemt-proxy}"
-TABLE="telemt_limit"
-CHAIN="forward"
-PORT="${PORT:-443}"
-RATE="${RATE:-1/second}"
-BURST="${BURST:-1}"
-METER_TIMEOUT="${METER_TIMEOUT:-60s}"
-
-IP=""
-for i in $(seq 1 60); do
-    RUNNING="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)"
-    if [ "$RUNNING" = "true" ]; then
-        IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "$CONTAINER" | awk 'NF {print; exit}')"
-        if [ -n "$IP" ]; then
-            break
-        fi
-    fi
-    sleep 1
-done
-
-if [ -z "$IP" ]; then
-    echo "Could not get IP for container: $CONTAINER" >&2
-    exit 1
-fi
-
-nft delete table inet "$TABLE" 2>/dev/null || true
-nft add table inet "$TABLE"
-nft "add chain inet $TABLE $CHAIN { type filter hook forward priority 0; policy accept; }"
-nft "add rule inet $TABLE $CHAIN ip daddr $IP tcp dport $PORT tcp flags & (syn | ack) == syn meter telemt_in_syn_per_client { ip saddr timeout $METER_TIMEOUT limit rate over $RATE burst $BURST packets } counter drop comment \"telemt_in_syn_per_client_${RATE}_burst_${BURST}\""
-
-echo "Applied telemt inbound SYN per-client limiter:"
-echo "container=$CONTAINER ip=$IP port=$PORT rate=$RATE burst=$BURST meter_timeout=$METER_TIMEOUT"
-nft list chain inet "$TABLE" "$CHAIN"
+IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "$CONTAINER" | awk 'NF {print; exit}')"
+[ -n "$IP" ] || { echo "Telemt container IP not found" >&2; exit 1; }
+iptables -N VPS-TELEMT 2>/dev/null || true
+iptables -C DOCKER-USER -j VPS-TELEMT 2>/dev/null ||
+  iptables -I DOCKER-USER 1 -j VPS-TELEMT
+iptables -F VPS-TELEMT
+iptables -A VPS-TELEMT -d "$IP" -p tcp --dport 443 --tcp-flags SYN,ACK SYN \
+  -m hashlimit --hashlimit-above 1/second --hashlimit-burst 1 \
+  --hashlimit-mode srcip --hashlimit-name vps_telemt_syn \
+  --hashlimit-htable-expire 60000 -j DROP
+iptables -A VPS-TELEMT -j RETURN
 EOF
-
-  cat > /usr/local/sbin/telemt-in-syn-watch.sh <<'EOF'
+  cat > "$watch" <<'EOF'
 #!/bin/sh
 set -u
-
 CONTAINER="${1:-telemt-proxy}"
-INTERVAL="${INTERVAL:-5}"
 LAST_IP=""
-
-echo "Watching Docker container for inbound SYN limiter: $CONTAINER"
-
 while true; do
-    RUNNING="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)"
-    if [ "$RUNNING" = "true" ]; then
-        IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "$CONTAINER" 2>/dev/null | awk 'NF {print; exit}')"
-        if [ -n "$IP" ] && [ "$IP" != "$LAST_IP" ]; then
-            echo "Container IP changed: ${LAST_IP:-none} -> $IP"
-            if /usr/local/sbin/telemt-in-syn-limit.sh "$CONTAINER"; then
-                LAST_IP="$IP"
-            else
-                echo "Failed to apply nft inbound SYN rule for $CONTAINER" >&2
-            fi
-        fi
-    else
-        if [ -n "$LAST_IP" ]; then
-            echo "Container $CONTAINER is not running"
-            LAST_IP=""
-        fi
+  RUNNING="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)"
+  if [ "$RUNNING" = true ]; then
+    IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "$CONTAINER" 2>/dev/null | awk 'NF {print; exit}')"
+    if [ -n "$IP" ] && [ "$IP" != "$LAST_IP" ]; then
+      if /usr/local/sbin/telemt-in-syn-limit.sh "$CONTAINER"; then
+        LAST_IP="$IP"
+      fi
     fi
-    sleep "$INTERVAL"
+  else
+    LAST_IP=""
+  fi
+  sleep 5
 done
 EOF
-
-  chmod +x /usr/local/sbin/telemt-in-syn-limit.sh /usr/local/sbin/telemt-in-syn-watch.sh
-
-  cat > /etc/systemd/system/telemt-in-syn-watch.service <<EOF
+  chmod 700 "$limit" "$watch"
+  record file "$limit"
+  record file "$watch"
+  cat > "$unit" <<'EOF'
 [Unit]
-Description=Watch telemt Docker container and refresh nft inbound SYN per-client limiter
+Description=Refresh Telemt per-client SYN limiter in DOCKER-USER
 Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target
@@ -495,148 +524,99 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-
-  systemctl disable --now telemt-synack-watch.service >/dev/null 2>&1 || true
+  chmod 600 "$unit"
+  record file "$unit"
   systemctl daemon-reload
+  record iptables_chain VPS-TELEMT
+  "$limit" telemt-proxy
   systemctl enable --now telemt-in-syn-watch.service
-
-  if systemctl is-active telemt-in-syn-watch.service >/dev/null 2>&1; then
-    ok "Telemt nftables watcher активен"
-  else
-    warn "Telemt nftables watcher не активен. Проверь: systemctl status telemt-in-syn-watch.service --no-pager"
-  fi
+  record service telemt-in-syn-watch.service
+  systemctl is-active --quiet telemt-in-syn-watch.service ||
+    die "Telemt limiter watcher did not start."
 }
 
 install_3x_ui() {
-  ok "Шаг: install_3x_ui"
-  command -v docker >/dev/null 2>&1 || die "3x-ui требует Docker (docker не найден)."
-
-  # idempotent: если контейнер уже есть — не создаём второй
-  if docker ps -a --format '{{.Names}}' | grep -qx '3x-ui'; then
-    warn "Контейнер 3x-ui уже существует. Пропускаю создание."
-    docker start 3x-ui || true
-  else
-    docker pull ghcr.io/mhsanaei/3x-ui:latest
-    docker run -d \
-      --name 3x-ui \
-      --restart unless-stopped \
-      --network host \
-      --privileged \
-      -v /etc/x-ui:/etc/x-ui \
-      -v /usr/local/x-ui:/usr/local/x-ui \
-      ghcr.io/mhsanaei/3x-ui:latest
+  if docker ps -a --format '{{.Names}}' | grep -qx 3x-ui; then
+    has_record container 3x-ui ||
+      die "Existing 3x-ui container is not managed by vps-bootstrap."
+    docker start 3x-ui >/dev/null || true
+    return
   fi
-
-  if docker ps --format '{{.Names}}' | grep -qx '3x-ui'; then
-    ok "3x-ui контейнер запущен"
-  else
-    warn "Контейнер 3x-ui не запущен. Проверь: docker logs 3x-ui"
-  fi
-
-  echo "Логи 3x-ui (initial setup):"
-  docker logs --tail 50 3x-ui || true
+  local dir image
+  for dir in /etc/x-ui /usr/local/x-ui; do
+    guard_new_dir "$dir"
+    if [[ ! -e $dir ]]; then
+      install -d -m 700 "$dir"
+      record dir "$dir"
+    fi
+  done
+  image=$(image_digest xui_image ghcr.io/mhsanaei/3x-ui:latest)
+  docker run -d \
+    --name 3x-ui \
+    --restart unless-stopped \
+    --network host \
+    --cap-drop ALL \
+    --cap-add NET_BIND_SERVICE \
+    --security-opt no-new-privileges:true \
+    -e XUI_ENABLE_FAIL2BAN=false \
+    -v /etc/x-ui:/etc/x-ui \
+    -v /usr/local/x-ui:/usr/local/x-ui \
+    "$image"
+  record container 3x-ui
+  docker ps --format '{{.Names}}' | grep -qx 3x-ui ||
+    die "3x-ui container did not stay running; inspect docker logs 3x-ui."
+  ok "3x-ui started without privileged mode."
 }
 
 add_aliases() {
-  ok "Шаг: add_aliases"
-  local home bashrc aliases_file marker block
-
-  home="$(getent passwd "$NEW_USER" | cut -d: -f6)"
-  [[ -n "$home" && -d "$home" ]] || die "Не найден home для пользователя $NEW_USER"
-
-  bashrc="$home/.bashrc"
-  aliases_file="$home/.bash_aliases"
-
-  # 1) Создать/обновить ~/.bash_aliases
-  backup_file_if_exists "$aliases_file" && ok "Сделан бэкап $aliases_file" || true
-  install -m 644 -o "$NEW_USER" -g "$NEW_USER" /dev/null "$aliases_file"
-
-  add_alias_line() {
-    local name="$1" value="$2"
-    grep -qE "^alias[[:space:]]+$name=" "$aliases_file" || echo "alias $name=\"$value\"" >> "$aliases_file"
-  }
-
-  add_alias_line update     "sudo apt update && sudo apt upgrade -y"
-  add_alias_line clear      "sudo docker system prune -a"
-  add_alias_line unban      "sudo fail2ban-client unban --all"
-  add_alias_line ctop       "sudo docker run --rm -ti -v /var/run/docker.sock:/var/run/docker.sock:ro quay.io/vektorlab/ctop:latest"
-  add_alias_line watchtower "sudo docker run --rm -v /var/run/docker.sock:/var/run/docker.sock nickfedor/watchtower --run-once --cleanup"
-
-  # 2) Гарантировать подключение ~/.bash_aliases из ~/.bashrc (на некоторых образах может отличаться)
-  marker="# --- bootstrap: load .bash_aliases ---"
-  block='if [ -f ~/.bash_aliases ]; then
-  . ~/.bash_aliases
-fi'
-  backup_file_if_exists "$bashrc" && ok "Сделан бэкап $bashrc" || true
-  append_block_once "$bashrc" "$marker" "$block" && ok "Добавлено подключение ~/.bash_aliases в ~/.bashrc" || true
-  chown "$NEW_USER:$NEW_USER" "$bashrc"
-
-  # 3) Проверка: alias update обязан быть в файле
-  if ! grep -qE '^alias[[:space:]]+update=' "$aliases_file"; then
-    die "Алиасы не записались в $aliases_file (проверка не прошла)."
+  local home aliases_file bashrc
+  home=$(getent passwd "$NEW_USER" | cut -d: -f6)
+  aliases_file=$home/.bash_aliases
+  bashrc=$home/.bashrc
+  [[ -e $aliases_file ]] || install -m 600 -o "$NEW_USER" -g "$NEW_USER" /dev/null "$aliases_file"
+  grep -q '^alias update=' "$aliases_file" ||
+    printf '%s\n' "alias update='sudo apt update && sudo apt upgrade'" >> "$aliases_file"
+  grep -q '^alias dps=' "$aliases_file" ||
+    printf '%s\n' "alias dps='sudo docker ps'" >> "$aliases_file"
+  chown "$NEW_USER:$NEW_USER" "$aliases_file"
+  chmod 600 "$aliases_file"
+  if ! grep -qF 'bootstrap: load .bash_aliases' "$bashrc"; then
+    cat >> "$bashrc" <<'EOF'
+# bootstrap: load .bash_aliases
+if [ -f ~/.bash_aliases ]; then . ~/.bash_aliases; fi
+EOF
   fi
-
-  ok "Алиасы добавлены в $aliases_file"
-  ok "Для активации: новый вход или 'source ~/.bashrc' под пользователем $NEW_USER"
+  chown "$NEW_USER:$NEW_USER" "$bashrc"
 }
 
-# ---------------- input ----------------
-echo "=== VPS Bootstrap (Ubuntu 24.04) ==="
-echo "Лог: $LOG_FILE"
-echo
-
-while true; do
-  NEW_USER="$(ask_default "Имя нового пользователя" "user")"
-  valid_user "$NEW_USER" && break
-  echo "Некорректное имя (не root, латиница/цифры/_/-)."
-done
-
-PUBLIC_KEY="$(ask_optional "Вставьте публичный SSH-ключ одной строкой")"
-[[ -n "$PUBLIC_KEY" ]] || die "SSH-ключ обязателен."
-valid_key "$PUBLIC_KEY" || die "Некорректный SSH-ключ."
-
-NEW_SSH_PORT="4422"
-ALLOW_IP=""
-INSTALL_TELEMT="y"
-TELEMT_PORT="1243"
-while true; do
-  TELEMT_TLS_DOMAIN="$(ask_default "Какой сайт использовать для TELEMT_TLS_DOMAIN" "petrovich.ru")"
-  valid_tls_domain "$TELEMT_TLS_DOMAIN" && break
-  echo "Некорректный домен. Пример: petrovich.ru"
-done
-ENABLE_UFW="y"
-OPEN_443="y"
-OPEN_22="y"
-INSTALL_F2B="y"
-INSTALL_DOCKER="y"
-ADD_DOCKER_GROUP="y"
-INSTALL_3X_UI="y"
-ADD_ALIASES="y"
-
-echo
-echo "=== План ==="
-echo "User: $NEW_USER | SSH port: $NEW_SSH_PORT | UFW: $ENABLE_UFW | Fail2ban: $INSTALL_F2B | Docker: $INSTALL_DOCKER | 3x-ui: $INSTALL_3X_UI | Telemt: $INSTALL_TELEMT | Telemt port: $TELEMT_PORT | Telemt TLS domain: $TELEMT_TLS_DOMAIN | Aliases: $ADD_ALIASES"
-echo
-
-ok "Стартуем без дополнительных вопросов."
-
 # ---------------- run ----------------
-install_basics
+if [[ $MODE == finalize ]]; then
+  enable_ufw_if_needed
+  finalize_ssh
+  apt-get update
+  install_basics
+  setup_fail2ban
+  install_docker
+  install_3x_ui
+  install_telemt
+  setup_telemt_tuning
+  add_aliases
+  ok "SSH and services configured. Verify one more login before closing the original session."
+  exit 0
+fi
+
+apt-get update
+apt_install ufw
 create_user
 setup_keys
-configure_ssh
-[[ "$ENABLE_UFW" == y ]] && setup_ufw
-[[ "$INSTALL_F2B" == y ]] && setup_fail2ban
-[[ "$INSTALL_DOCKER" == y ]] && install_docker
-[[ "$INSTALL_DOCKER" == y && "$INSTALL_3X_UI" == y ]] && install_3x_ui
-[[ "$INSTALL_TELEMT" == y ]] && install_telemt
-[[ "$INSTALL_TELEMT" == y ]] && setup_telemt_tuning
-[[ "$ADD_ALIASES" == y ]] && add_aliases
+setup_ufw
+prepare_ssh
 
-echo
-echo "=== Готово ==="
-echo "Вход: ssh -p $NEW_SSH_PORT $NEW_USER@<IP_СЕРВЕРА>"
-echo "Лог: $LOG_FILE"
-echo "Если включали Telemt: порт ${TELEMT_PORT}/tcp открыт в UFW (если UFW включали), TLS domain: ${TELEMT_TLS_DOMAIN}"
-echo "Telemt nftables watcher: systemctl status telemt-in-syn-watch.service --no-pager"
-echo "Алиасы (если включали): новый вход или 'source ~/.bashrc'"
+cat <<EOF
+SSH preparation complete. Do NOT close this root session yet.
+From a second terminal, run: ssh -p $NEW_SSH_PORT $NEW_USER@<SERVER_ADDRESS>
+Confirm that sudo works, then on the VPS run:
+  sudo bash /tmp/vps-bootstrap.sh --finalize --confirm-ssh-login
+Finalization hardens SSH and installs the remaining services.
+Log: $LOG_FILE
+EOF
