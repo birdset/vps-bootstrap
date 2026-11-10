@@ -1,0 +1,20 @@
+name: Final proposal shell checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax-and-lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Bash syntax
+        run: bash -n 10-11-2026-bootstrap-proposal-v3.sh 10-11-2026-unbootstrap-proposal-v4.sh
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Check shell errors
+        run: shellcheck --severity=warning 10-11-2026-bootstrap-proposal-v3.sh 10-11-2026-unbootstrap-proposal-v4.sh
