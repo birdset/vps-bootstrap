@@ -309,7 +309,6 @@ EOF
   ok "Docker installed from the official apt repository."
 }
 install_telemt() {
-  ok "Шаг: install_telemt"
   command -v docker >/dev/null 2>&1 || die "Telemt требует Docker (docker не найден)."
   docker compose version >/dev/null 2>&1 || die "Telemt требует docker compose plugin (docker compose не найден)."
 
@@ -590,7 +589,30 @@ EOF
 }
 
 # ---------------- run ----------------
+if [[ $MODE == prepare ]]; then
+  apt-get update
+  apt_install ufw
+  create_user
+  setup_keys
+  setup_ufw
+  prepare_ssh
+
+  cat <<EOF
+Подготовительный этап завершён. Не закрывайте это SSH-окно.
+В другом терминале подключитесь к VPS:
+  ssh -p $NEW_SSH_PORT $NEW_USER@<АДРЕС_СЕРВЕРА>
+В новом окне проверьте sudo командой: sudo -v
+Когда вход и sudo проверены, вернитесь сюда и введите SSH_OK.
+Если подключиться не удалось, ничего не подтверждайте и используйте исходную сессию.
+EOF
+  read -r -p "После успешной проверки SSH введите SSH_OK: " answer || die "Ввод завершён."
+  [[ $answer == SSH_OK ]] || die "Проверка не подтверждена. Исходная SSH-сессия оставлена."
+  CONFIRM_LOGIN=true
+  MODE=finalize
+fi
+
 if [[ $MODE == finalize ]]; then
+  [[ $CONFIRM_LOGIN == true ]] || die "Сначала проверьте вход по SSH в отдельной сессии."
   enable_ufw_if_needed
   finalize_ssh
   apt-get update
@@ -601,22 +623,6 @@ if [[ $MODE == finalize ]]; then
   install_telemt
   setup_telemt_tuning
   add_aliases
-  ok "SSH and services configured. Verify one more login before closing the original session."
+  ok "Настройка завершена. Перед закрытием исходной сессии проверьте ещё одно новое SSH-подключение."
   exit 0
 fi
-
-apt-get update
-apt_install ufw
-create_user
-setup_keys
-setup_ufw
-prepare_ssh
-
-cat <<EOF
-SSH preparation complete. Do NOT close this root session yet.
-From a second terminal, run: ssh -p $NEW_SSH_PORT $NEW_USER@<SERVER_ADDRESS>
-Confirm that sudo works, then on the VPS run:
-  sudo bash /tmp/vps-bootstrap.sh --finalize --confirm-ssh-login
-Finalization hardens SSH and installs the remaining services.
-Log: $LOG_FILE
-EOF
