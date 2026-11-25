@@ -1,95 +1,66 @@
 # VPS Bootstrap (Ubuntu 24.04)
 
-Interactive first-time setup for a **new** Ubuntu 24.04 VPS. It creates a sudo
-user, configures SSH and UFW, installs Fail2ban and Docker, and starts Telemt
-and 3x-ui. The script is intentionally split into preparation and SSH
-finalization so that you can verify a real login before disabling root login.
+Интерактивная первоначальная настройка **нового** VPS с Ubuntu 24.04. Скрипт создаёт пользователя с правами sudo, настраивает SSH и UFW, устанавливает Fail2ban и Docker, запускает Telemt и 3x-ui.
 
-The script refuses to take over an existing user, Telemt directory, 3x-ui
-container or SSH drop-in. It is not an in-place upgrade tool for an earlier
-vps-bootstrap installation.
+Установка выполняется одним запуском: сначала скрипт подготавливает нового пользователя и SSH, затем ждёт, пока вы проверите вход в отдельной SSH-сессии. После подтверждения он продолжает настройку в том же процессе. Не закрывайте исходную SSH-сессию, пока не проверите ещё один новый вход.
 
-## Before you start
+Скрипт не забирает под управление существующего пользователя, каталог Telemt, контейнер 3x-ui или SSH drop-in. Он не предназначен для обновления уже настроенной установки vps-bootstrap.
 
-- Have a working console or recovery access from the VPS provider.
-- Save a provider snapshot or backup.
-- Keep the current SSH session open throughout setup.
-- Ensure the provider's external firewall will allow the new SSH port
-  `4422/tcp` and Telemt port `1243/tcp`.
-- Have a public SSH key and a domain to use for Telemt TLS masking.
-- Review the downloaded script before running it as root.
+## Перед началом
 
-## Installation
+- Убедитесь, что у вас есть доступ к консоли или восстановлению VPS через панель провайдера.
+- Создайте снимок или резервную копию VPS.
+- Не закрывайте текущую SSH-сессию во время настройки.
+- Разрешите во внешнем firewall провайдера TCP-порты `4422` для нового SSH-подключения и `1243` для Telemt.
+- Подготовьте открытый SSH-ключ и домен для маскировки TLS в Telemt.
+- Перед запуском проверьте содержимое скачиваемого скрипта.
 
-On the VPS, from the existing root SSH session:
+## Установка
+
+Перед запуском при желании проверьте исходный код [bootstrap.sh на GitHub](https://github.com/birdset/vps-bootstrap/blob/main/bootstrap.sh). Затем выполните **одну строку** в текущей SSH-сессии на VPS:
 
 ```bash
-curl -fsSLo /tmp/vps-bootstrap.sh https://raw.githubusercontent.com/birdset/vps-bootstrap/main/bootstrap.sh
-less /tmp/vps-bootstrap.sh
-bash /tmp/vps-bootstrap.sh --prepare
+curl -fsSLo /tmp/vps-bootstrap.sh https://raw.githubusercontent.com/birdset/vps-bootstrap/main/bootstrap.sh && sudo bash /tmp/vps-bootstrap.sh
 ```
 
-The script asks for the new user name, public key, and Telemt TLS domain.
-Preparation creates the user and key, then listens on the old and new SSH ports.
-It prepares UFW rules but enables UFW only after the new login is verified.
-It does **not** disable the old SSH login or install containers yet.
+Скрипт запросит имя нового пользователя, открытый SSH-ключ, домен Telemt и пароль пользователя.
 
-On your **local computer**, open a second terminal. Keep the first session open:
+Когда появится сообщение о подготовке SSH:
 
-```bash
-ssh -p 4422 <user>@<server-address>
-```
+1. Оставьте исходное окно открытым. На своём компьютере откройте **второе** окно терминала и подключитесь к VPS:
+   ```bash
+   ssh -p 4422 <пользователь>@<адрес-сервера>
+   ```
+2. В новой SSH-сессии проверьте права sudo:
+   ```bash
+   sudo -v
+   ```
+3. Вернитесь в исходное окно и введите `SSH_OK`. Скрипт продолжит установку автоматически; отдельную команду финализации запускать не нужно.
 
-In the **new VPS session**, verify that `sudo -v` works. Only then run:
+Если новый SSH-вход не работает, не вводите `SSH_OK`. Остановите скрипт клавишами `Ctrl+C`, оставьте исходное подключение открытым и проверьте конфигурацию через консоль провайдера. Скрипт на подготовительном этапе сохраняет вход root и текущий SSH-порт.
 
-```bash
-sudo bash /tmp/vps-bootstrap.sh --finalize --confirm-ssh-login
-```
+После завершения откройте ещё одну новую SSH-сессию на порту 4422. Только после успешной проверки закрывайте исходное окно.
 
-Finalization installs the remaining services. Open one more new SSH session on
-port 4422 before closing the original session.
-If the login fails, use the original session or provider console to inspect
-`/etc/ssh/sshd_config.d/00-vps-bootstrap.conf`, `sshd -t`, `sshd -T`,
-`ufw status`, and the provider firewall.
+## Что меняет установщик
 
-## What the installer changes
+- Создаёт нового пользователя sudo и добавляет переданный открытый ключ.
+- Создаёт управляемый SSH drop-in. На этапе подготовки оставляет старый порт и добавляет новый. После вашего подтверждения отключает вход root и вход по паролю и проверяет итоговые параметры sshd.
+- Добавляет правила UFW для портов 4422/tcp и 1243/tcp. Если UFW был выключен, скрипт включает его только после проверки нового SSH-входа. Существующие правила он не сбрасывает и не открывает старый SSH-порт для всех.
+- Добавляет отдельную конфигурацию Fail2ban для SSH.
+- Если Docker отсутствует, устанавливает его из официального apt-репозитория Docker. Скрипт не удаляет конфликтующие пакеты автоматически, не запускает `apt upgrade` и не добавляет нового пользователя в группу `docker`, которая даёт права уровня root. Используйте `sudo docker`.
+- Запускает Telemt через Docker Compose. Файл с секретом и журнал установки доступны только root. API доступен локально и требует случайный заголовок авторизации; ссылка подключения не попадает в журнал.
+- Запускает 3x-ui без `--privileged`, но с сетевым режимом хоста. Открывайте в UFW только порты панели и прокси, которые настроили. Встроенный Fail2ban 3x-ui выключен, потому что ему нужны административные сетевые права хоста. До настройки отдельной политики доступа держите панель закрытой в UFW.
+- При первой загрузке получает digest каждого образа и сохраняет его для следующих запусков. Перед использованием в рабочей среде проверьте выбранные digest.
+- Добавляет ограничение SYN-запросов Telemt для каждого клиента в отдельную цепочку `VPS-TELEMT`, подключённую к `DOCKER-USER`. Правило действует только для IPv4.
+- Добавляет два alias, не очищая существующий файл `~/.bash_aliases`.
 
-- Creates a new sudo user and adds the supplied public key.
-- Adds a managed SSH drop-in. Preparation listens on the original and new
-  ports. Finalization disables root and password SSH login and checks the
-  effective sshd settings.
-- Adds UFW rules for 4422/tcp and 1243/tcp. It enables UFW during finalization
-  if it was inactive, after you verify the new SSH login. It does not reset
-  existing rules or open the old SSH port broadly.
-- Adds a managed Fail2ban SSH jail.
-- Installs Docker from Docker's official apt repository if Docker is absent.
-  It refuses to uninstall conflicting packages automatically. It does not run
-  `apt upgrade` or add the new user to the root-equivalent `docker` group.
-  Use `sudo docker` instead.
-- Starts Telemt in Docker Compose. Its secret configuration and installation
-  log are restricted to root. The loopback API requires a random authorization
-  header; its connection link is not printed to the log.
-- Starts 3x-ui without `--privileged`. It uses host networking; open only the
-  panel and proxy ports you actually configure. Its bundled Fail2ban is
-  disabled because it needs host network administration capabilities. Keep
-  the panel blocked by UFW until you configure a suitable access policy.
-- Resolves each container image to a digest at first pull and records that
-  digest for later runs. Review the selected digest before using this script
-  in production.
-- Installs a per-client Telemt SYN limiter in a dedicated `VPS-TELEMT`
-  chain attached to Docker's `DOCKER-USER` chain. The rule is IPv4 only.
-- Adds two aliases without clearing an existing `~/.bash_aliases` file.
+Состояние хранится в `/var/lib/vps-bootstrap`, журнал — в `/var/log/vps-bootstrap.log`. Читать их может только root. Не редактируйте файлы состояния вручную.
 
-State is kept under `/var/lib/vps-bootstrap`; the installation log is
-`/var/log/vps-bootstrap.log`. The state and log are root-readable only.
-Do not edit the state files by hand.
+Опубликованные Docker-порты могут обходить обычные входящие правила UFW. Проверьте опубликованные порты командой `sudo docker ps` и проверьте доступность с другого подключения.
 
-Docker-published ports bypass ordinary UFW input rules. Inspect published
-ports with `sudo docker ps` and test from a separate network.
+## Безопасная очистка
 
-## Safe cleanup
-
-Download the cleanup script to a local file on the VPS:
+Скачайте скрипт очистки, посмотрите его и сначала выполните пробный просмотр:
 
 ```bash
 curl -fsSLo /tmp/vps-unbootstrap.sh https://raw.githubusercontent.com/birdset/vps-bootstrap/main/unbootstrap.sh
@@ -97,27 +68,16 @@ less /tmp/vps-unbootstrap.sh
 sudo bash /tmp/vps-unbootstrap.sh --dry-run
 ```
 
-Review the exact list. To proceed:
+Если список действий подходит, примените очистку:
 
 ```bash
 sudo bash /tmp/vps-unbootstrap.sh --apply
 ```
 
-The cleanup requires you to type `CLEANUP`. It stops managed services,
-removes managed containers and their limiter and Fail2ban files, and closes the
-Telemt UFW port that the script opened. It deliberately retains SSH settings,
-the user and UFW to avoid locking out access or exposing other services.
+Для подтверждения нужно ввести `CLEANUP`. Скрипт останавливает управляемые службы, удаляет управляемые контейнеры, файлы ограничителя и Fail2ban, а также закрывает правило UFW для порта Telemt, которое добавил установщик. Настройки SSH, пользователя и UFW остаются, чтобы не потерять доступ к серверу и не открыть другие службы.
 
-**Data remains intact:** the user, SSH settings, Docker engine, packages, images, volumes,
-`/opt/telemt`, `/etc/x-ui`, `/usr/local/x-ui`, and installation state are
-retained. This is safe cleanup, not a full restoration of the original OS
-image. Restore a provider snapshot for a full rollback. Never remove the
-remaining user until another administrative login has been tested.
+**Данные сохраняются:** пользователь, SSH-настройки, Docker, установленные пакеты, образы, тома, `/opt/telemt`, `/etc/x-ui`, `/usr/local/x-ui` и состояние установки. Это безопасная очистка, а не полное восстановление исходной ОС. Для полного отката восстановите снимок VPS. Не удаляйте оставшегося пользователя, пока не проверите вход через другую учётную запись администратора.
 
-## Validation before production use
+## Проверка перед рабочим использованием
 
-On Ubuntu 24.04, run `bash -n` and ShellCheck on both scripts. In an isolated
-test VPS, check fresh installation, second-session SSH login, finalization,
-repeat preparation, failure during each stage, cleanup, and a host that had
-Docker and UFW before installation. Verify the existing containers and their
-data survive cleanup.
+На Ubuntu 24.04 выполните `bash -n` и ShellCheck для обоих скриптов. На изолированном тестовом VPS проверьте чистую установку, вход по SSH во второй сессии, продолжение установки после подтверждения, повторную подготовку, сбои на каждом этапе, очистку и сервер, где до установки уже были Docker и UFW. Убедитесь, что существующие контейнеры и данные остаются нетронутыми.
