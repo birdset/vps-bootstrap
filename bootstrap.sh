@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-# Ubuntu 24.04. Run prepare as root, verify a new SSH session, then run --finalize.
+# Ubuntu 24.04 and 26.04. Run prepare as root, verify a new SSH session, then continue.
 STATE_DIR=/var/lib/vps-bootstrap
 STATE_FILE=$STATE_DIR/settings.tsv
 MANIFEST=$STATE_DIR/created.tsv
@@ -35,7 +35,7 @@ while (($#)); do
 done
 [[ $(id -u) -eq 0 ]] || die "Run as root: sudo bash bootstrap.sh"
 . /etc/os-release
-[[ ${ID:-} == ubuntu && ${VERSION_ID:-} == 24.04 ]] || die "Only Ubuntu 24.04 is supported."
+[[ ${ID:-} == ubuntu && ( ${VERSION_ID:-} == 24.04 || ${VERSION_ID:-} == 26.04 ) ]] || die "Supported systems: Ubuntu 24.04 and 26.04."
 install -d -m 700 "$STATE_DIR"
 touch "$MANIFEST" "$STATE_FILE"
 chmod 600 "$MANIFEST" "$STATE_FILE"

@@ -9,7 +9,11 @@ permissions:
 
 jobs:
   syntax-and-lint:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu-version: [24.04, 26.04]
+    runs-on: ubuntu-${{ matrix.ubuntu-version }}
     steps:
       - uses: actions/checkout@v4
       - name: Check Bash syntax
