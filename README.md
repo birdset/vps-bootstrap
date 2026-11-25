@@ -17,13 +17,13 @@
 
 ## Установка
 
-Выполните **одну строку** в текущей SSH-сессии на VPS:
+Перед запуском при желании проверьте исходный код [bootstrap.sh на GitHub](https://github.com/birdset/vps-bootstrap/blob/main/bootstrap.sh). Затем выполните **одну строку** в текущей SSH-сессии на VPS:
 
 ```bash
-curl -fsSLo /tmp/vps-bootstrap.sh https://raw.githubusercontent.com/birdset/vps-bootstrap/main/bootstrap.sh && less /tmp/vps-bootstrap.sh && sudo bash /tmp/vps-bootstrap.sh
+curl -fsSLo /tmp/vps-bootstrap.sh https://raw.githubusercontent.com/birdset/vps-bootstrap/main/bootstrap.sh && sudo bash /tmp/vps-bootstrap.sh
 ```
 
-После просмотра файла нажмите `q`, чтобы выйти из `less`; скрипт запустится следом. Он запросит имя нового пользователя, открытый SSH-ключ, домен Telemt и пароль пользователя.
+Скрипт запросит имя нового пользователя, открытый SSH-ключ, домен Telemt и пароль пользователя.
 
 Когда появится сообщение о подготовке SSH:
 
